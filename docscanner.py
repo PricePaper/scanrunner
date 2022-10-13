@@ -73,10 +73,21 @@ class DocumentImage(ABC):
 
     @abstractmethod
     def _read(self) -> None:
+        """
+        This method must be implemented by the child class as each document type has a different format.
+        :return: None
+        :rtype: None
+        """
         pass
 
     @property
     def name(self) -> str:
+        """
+        The title of the document. E.g. the invoice number, picking number, etc. This method is a lazy load, if the
+        value is not set, it will call the _read() method to get the value, then store it in the object.
+        :return: the document's title
+        :rtype: str
+        """
 
         if self._name == "":
             self._read()
@@ -85,7 +96,7 @@ class DocumentImage(ABC):
 
     @name.setter
     def name(self, value):
-        raise NotImplementedError("You cannot set this field. Try reset()")
+        raise NotImplementedError("This field can not be set. Try reset() to clear it.")
 
     def reset(self):
 
@@ -102,13 +113,23 @@ class DocumentImage(ABC):
 
     @abstractmethod
     def _mark_region(self):
+        """
+        This method finds and defines regions in the image file using opencv2. Once the regions are identified, we can
+        feed them to tesseract for OCR.
+
+        This method is fully implemented. However, it requires a value for self.threshold_region_ignore which is not
+        set in the abstract base class as it is specific to the document. Thus, the method can only be called by
+        the child class. Using super() is sufficient.
+            class ChildClass(DocumentImage):
+                def _mark_region(self):
+                    super()._mark_region()
+        :return: None
+        :rtype: None
+        """
 
         image = cv2.imread(self.filename)
 
-        try:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        except AssertionError:
-            gray = image
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
         blur = cv2.GaussianBlur(gray, (9, 9), 0)
         thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 30)
@@ -154,7 +175,11 @@ class Invoice(DocumentImage):
     def __init__(self, file):
         super().__init__(file)
 
+        self.threshold_region_ignore = 80
         self.regex: re.Pattern = re.compile(r'(/20[0-9]{2}/[0-9]{4,7})')  # Matches /2022/NNNN+
+
+    def _mark_region(self):
+        return super(Invoice, self)._mark_region()
 
     def _read(self) -> None:
         invoice: str = ''

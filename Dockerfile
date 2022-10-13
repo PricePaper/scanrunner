@@ -18,11 +18,9 @@ RUN apk upgrade && \
       py3-pillow \
       py3-packaging \
       py3-parsing &&\
-   su -l -c "pip3 --no-cache install pytesseract" scanner
+      pip3 --no-cache -q install pytesseract
 
-COPY entrypoint.sh read_inv.py config.yaml /
-
-#VOLUME ['/scanner']
+COPY entrypoint.sh docscanner.py config.yaml /
 
 ENTRYPOINT ["/sbin/tini", "--"]
 
