@@ -11,6 +11,7 @@ RUN apk upgrade && \
       su-exec \
       tesseract-ocr \
       py3-pip \
+      py3-magic \
       py3-yaml \
       py3-numpy \
       py3-opencv \

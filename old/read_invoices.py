@@ -19,7 +19,7 @@ def mark_region(image_path):
     image = cv2.imread(image_path)
 
     # define threshold of regions to ignore
-    THRESHOLD_REGION_IGNORE = 80
+    THRESHOLD_REGION_IGNORE = 60
 
     try:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)

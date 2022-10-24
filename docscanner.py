@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import base64
+import logging
 import os
 import re
 import ssl
 import sys
 import xmlrpc.client
-from abc import ABC, abstractmethod
 from pathlib import Path
+from time import sleep
+from typing import Any
 
 try:
     import psutil
@@ -33,34 +35,54 @@ except ImportError:
     print("The PyYAML module is not installed.", sys.stderr)
     sys.exit(1)
 
+try:
+    import magic
+except ImportError:
+    print("The python-magic module is not installed.", sys.stderr)
+    sys.exit(1)
+
 with open('/config.yaml') as f:
+    # global config
     config = yaml.safe_load(f)
 
 # Set default server config to tests server
-server = "odoo-dev"
+server = "odoo"
 
 # get login info from the config file
-url = config[server]['url']
-db = config[server]['database']
-username = config[server]['username']
-password = config[server]['password']
+url = config['servers'][server]['url']
+db = config['servers'][server]['database']
+username = config['servers'][server]['username']
+password = config['servers'][server]['password']
 
 # get path to tesseract from config
 pytesseract.pytesseract.tesseract_cmd = config['tesseract-bin']
 
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+# create file handler which logs even debug messages
+# create console handler with a higher log level
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+# create formatter and add it to the handlers
+formatter = logging.Formatter('%(asctime)s - %(processName)s - %(levelname)s - %(message)s')
+ch.setFormatter(formatter)
+# add the handlers to logger
+logger.addHandler(ch)
+
 # get uid of Odoo user
-with xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", allow_none=True,
+with xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", allow_none=True, verbose=True,
                                context=ssl._create_unverified_context()) as common:
     uid = common.authenticate(db, username, password, {})
     # Cleanup
     del common
 
 
-class DocumentImage(ABC):
+class DocumentImage:
 
     def __init__(self, file):
         """
-        Abstract Base Class for all document images being processed by OCR
+        Class for all document images being processed by OCR
         :param file: The file to be processed
         :type file: Path or string that will be converted to a Path object
         """
@@ -68,17 +90,71 @@ class DocumentImage(ABC):
         # if we're passed a string, convert to Path
         self.file: Path = file if type(file) == Path else Path(file)
         self._name: str = ""
-        self.filename = str(self.file)
-        self._threshold_region_ignore = 0
+        self.document_type = None
+        self._odoo_id: int = 0
 
-    @abstractmethod
-    def _read(self) -> None:
+        for fileglob in config['document_type'].keys():
+            if self.file.match(fileglob):
+                self.document_type = config['document_type'][fileglob]
+
+        # self.document_type:str = [config['file_type'][fileglob] for
+        #                   fileglob in config['document_type']
+        #                   if self.file.match(config['document_type'][fileglob])
+        #                   ][0]
+
+        self._odoo_sequence: str = config['documents'][self.document_type]['odoo_sequence']
+        self._threshold_region_ignore: int = config['documents'][self.document_type]['threshold_region_ignore']
+        self.regex: re.Pattern = re.compile(config['documents'][self.document_type]['ocr_regex'])
+        self._regions_list: list[list[int]] = config['documents'][self.document_type]['regions']
+
+    @property
+    def filename(self):
+        return str(self.file)
+
+    @filename.setter
+    def filename(self, filename: str):
+        self.file = Path(filename)
+
+    @property
+    def odoo_sequence(self) -> str:
+        """
+        The sequence string Odoo uses to preface document numbers of this type
+        :return: Odoo document sequence
+        :rtype: str
+        """
+
+        return self._odoo_sequence
+
+    @odoo_sequence.setter
+    def odoo_sequence(self, value):
+
+        raise NotImplementedError("This field can not be set. Please modify the config.yaml instead.")
+
+    def _read(self) -> str:
         """
         This method must be implemented by the child class as each document type has a different format.
         :return: None
         :rtype: None
         """
-        pass
+
+        invoice: str = ''
+        image, line_items_coordinates = self._mark_region()
+
+        # the invoice number usually lives in regions -1 to -3
+        for regions in self._regions_list:
+            for i in regions:
+                try:
+                    t: str = self._read_text(image, line_items_coordinates, -i).replace('\n', ' ')
+                    logger.debug(f'Region: {i} Invoice: {invoice}')
+                    m = self.regex.search(t)
+                    invoice = m.group(1)
+
+                except IndexError:
+                    break
+                except Exception:
+                    pass
+
+        return invoice
 
     @property
     def name(self) -> str:
@@ -89,8 +165,19 @@ class DocumentImage(ABC):
         :rtype: str
         """
 
-        if self._name == "":
-            self._read()
+        while self._name == "" and self.threshold_region_ignore >= config['documents'][self.document_type][
+            'threshold_region_ignore_min']:
+            name = self._read()
+
+            # If we still don't have a name, increase sensitivity and try again
+            if name:
+                self._name = self.odoo_sequence + name
+            else:
+                self.threshold_region_ignore -= config['documents'][self.document_type][
+                    'threshold_region_ignore_decrement']
+                logger.info(
+                    f"{self.filename} can not be parsed. Changing OCR sensitivity {self.threshold_region_ignore + config['documents'][self.document_type]['threshold_region_ignore_decrement']} -> {self.threshold_region_ignore}."
+                )
 
         return self._name
 
@@ -98,7 +185,13 @@ class DocumentImage(ABC):
     def name(self, value):
         raise NotImplementedError("This field can not be set. Try reset() to clear it.")
 
-    def reset(self):
+    def reset(self) -> None:
+        """
+        Resets the objects name property back to an empty string. Calling the objects
+        name getter will reread the file.
+        :return: None
+        :rtype: None
+        """
 
         self._name = ""
 
@@ -111,18 +204,11 @@ class DocumentImage(ABC):
         self._threshold_region_ignore = threshold_region_ignore
         self.reset()
 
-    @abstractmethod
     def _mark_region(self):
         """
         This method finds and defines regions in the image file using opencv2. Once the regions are identified, we can
         feed them to tesseract for OCR.
 
-        This method is fully implemented. However, it requires a value for self.threshold_region_ignore which is not
-        set in the abstract base class as it is specific to the document. Thus, the method can only be called by
-        the child class. Using super() is sufficient.
-            class ChildClass(DocumentImage):
-                def _mark_region(self):
-                    super()._mark_region()
         :return: None
         :rtype: None
         """
@@ -142,7 +228,7 @@ class DocumentImage(ABC):
         cnts = cv2.findContours(dilate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cnts = cnts[0] if len(cnts) == 2 else cnts[1]
 
-        line_items_coordinates = []
+        line_items_coordinates: list[list[tuple[Any, Any]]] = []
         for c in cnts:
             area = cv2.contourArea(c)
             x, y, w, h = cv2.boundingRect(c)
@@ -155,7 +241,7 @@ class DocumentImage(ABC):
 
         return image, line_items_coordinates
 
-    def _read_text(self, image, line_items_coordinates, index):
+    def _read_text(self, image, line_items_coordinates, index) -> str:
         # get co-ordinates to crop the image
         c = line_items_coordinates[index]
 
@@ -169,84 +255,65 @@ class DocumentImage(ABC):
         text = str(pytesseract.image_to_string(thresh1, config='--psm 6'))
         return text
 
+    @property
+    def odoo_id(self) -> int:
+        if self._odoo_id:
+            return self._odoo_id
 
-class Invoice(DocumentImage):
-
-    def __init__(self, file):
-        super().__init__(file)
-
-        self.threshold_region_ignore = 80
-        self.regex: re.Pattern = re.compile(r'(/20[0-9]{2}/[0-9]{4,7})')  # Matches /2022/NNNN+
-
-    def _mark_region(self):
-        return super(Invoice, self)._mark_region()
-
-    def _read(self) -> None:
-        invoice: str = ''
-        image, line_items_coordinates = self._mark_region()
-
-        # the invoice number usually lives in regions -1 to -3
-        region: int = 0
-        for i in (1, 2, 3, 4):
+        retry: int = 0
+        while retry < config['retry']:
             try:
-                t: str = self._read_text(image, line_items_coordinates, -i).replace('\n', ' ')
-
-                # invoice, inv_date, partner = invoice_rexp.search(t).groups()
-                # print(f'Region: {i} Invoice: {invoice} date: {inv_date} partner-code: {partner}')
-                m = self.regex.search(t)
-                invoice = m.group(1)
-                region = i
-
-            except IndexError:
-                region = 0
-                break
-            except Exception:
-                region = 0
-                pass
-
-        # Check to see if we got anything useful, or try again in regions -5 through -7
-        if region == 0:
-            for i in (5, 6, 7, 8):
-                try:
-                    t = self._read_text(image, line_items_coordinates, -i).replace('\n', ' ')
-                    # invoice, inv_date, partner = invoice_rexp.search(t).groups()
-                    # print(f'Region: {i} Invoice: {invoice} date: {inv_date} partner-code: {partner}')
-                    m = self.regex.search(t)
-                    invoice = m.group(1)
-                    region = i
-                except IndexError:
-                    region = 0
+                if self._odoo_id == 0 and self.name:
+                    with xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True,
+                                                   context=ssl._create_unverified_context()) as models:
+                        res = models.execute_kw(db, uid, password,
+                                                config['documents'][self.document_type]['odoo_object'],
+                                                'search_read', [[['name', '=', self.name]]],
+                                                {'fields': ['id', 'name']}
+                                                )
+                        if res and res[0]['name'] == self.name:
+                            self._odoo_id = res[0]['id']
+                else:
                     break
-                except Exception:
-                    region = 0
-                    pass
+            except Exception as e:
+                logger.error(e)
+                self._odoo_id = 0
+                retry += 1
+                sleep(config['retry_sleep'])
 
-        self.name = invoice
+        return self._odoo_id
 
+    @odoo_id.setter
+    def odoo_id(self, odoo_id: int) -> None:
+        raise NotImplementedError("This field can not be set.")
 
-def attach_invoice(invoice: str, filename: str):
-    with xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True,
-                                   context=ssl._create_unverified_context()) as models:
-        res = models.execute_kw(db, uid, password, 'account.move', 'search_read',
-                                [[['name', '=', invoice]]],
-                                {'fields': ['id', 'name']}
-                                )
+    def save(self) -> int:
+        retry: int = 0
+        while retry < config['retry']:
+            try:
+                if self.odoo_id:
+                    with xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True,
+                                                   context=ssl._create_unverified_context()) as models:
+                        with self.file.open('rb') as f:
+                            data = base64.b64encode(f.read())
+                            values = {
+                                'name': self.name.replace('/', '-') + '_' + self.filename.replace('/', '-'),
+                                'res_id': self.odoo_id,
+                                'res_model': config['documents'][self.document_type]['odoo_object'],
+                                'datas': data.decode('ascii')
+                            }
+                            res = models.execute_kw(db, uid, password, 'ir.attachment', 'create', [values, ])
 
-        if res:
-            odoo_invoice = res[0]
-            with open(filename, 'rb') as f:
-                data = base64.b64encode(f.read())
-                values = {
-                    'name': invoice.replace('/', '-') + '_' + filename,
-                    'res_id': odoo_invoice.get('id'),
-                    'res_model': 'account.move',
-                    'datas': data.decode('ascii')
-                }
-                res = models.execute_kw(db, uid, password, 'ir.attachment', 'create', [values, ])
+                            return res
+                else:
+                    break
 
-                return res
-        else:
-            return None
+            except Exception as e:
+                logger.error(e)
+                retry += 1
+                sleep(config['retry_sleep'])
+
+        return 0
 
 
 def main():
@@ -263,11 +330,23 @@ def main():
 
     # for filename in path.glob('*.png'):
     for filename in path.glob('*.jpg'):
-        invoice: str = read_invoice(str(filename), invoice_rexp)
-        if invoice:
-            res = attach_invoice(invoice, str(filename))
+        res = 0
+        invoice: DocumentImage = DocumentImage(filename)
+        if invoice.odoo_id and invoice.name:
+            try:
+                res = invoice.save()
+            except Exception as e:
+                logger.error(e)
+
             if res:
-                filename.rename(done_path.joinpath(invoice.replace('/', '-') + '_' + filename.name))
+                logger.info(f"Moving {invoice.filename} to {done_path}")
+                filename.rename(
+                    done_path.joinpath(
+                        f"{invoice.name.replace('/', '-')}_{invoice.odoo_id}_{invoice.filename.replace('/', '-')}"))
+        else:
+            if invoice.name:
+                # filename.replace(invoice.name.replace('/', '-') + '_' + invoice.filename.replace('/', '-'))
+                logger.warning(f"{invoice.name or invoice.filename} can not be processed at this time.")
 
 
 if __name__ == "__main__":
