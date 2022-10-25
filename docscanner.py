@@ -41,6 +41,13 @@ except ImportError:
     print("The python-magic module is not installed.", sys.stderr)
     sys.exit(1)
 
+try:
+    from PIL import Image
+except ImportError:
+    print("The Pillow module is not installed.", sys.stderr)
+    sys.exit(1)
+
+
 with open('/config.yaml') as f:
     # global config
     config = yaml.safe_load(f)
