@@ -47,20 +47,6 @@ except ImportError:
     print("The Pillow module is not installed.", sys.stderr)
     sys.exit(1)
 
-
-with open('/config.yaml') as f:
-    # global config
-    config = yaml.safe_load(f)
-
-# Set default server config to tests server
-server = "odoo"
-
-# get login info from the config file
-url = config['servers'][server]['url']
-db = config['servers'][server]['database']
-username = config['servers'][server]['username']
-password = config['servers'][server]['password']
-
 # get path to tesseract from config
 pytesseract.pytesseract.tesseract_cmd = config['tesseract-bin']
 
@@ -83,6 +69,18 @@ with xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", allow_none=True, verbos
     uid = common.authenticate(db, username, password, {})
     # Cleanup
     del common
+
+
+def _config(config_file: str = '/etc/docscanner.conf', server_name: str = "development") -> yaml.SafeLoader:
+    with open(config_file) as f:
+        # global config
+        config: yaml.SafeLoader = yaml.safe_load(f)
+
+        # get login info from the config file
+        url = config['servers'][server]['url']
+        db = config['servers'][server]['database']
+        username = config['servers'][server]['username']
+        password = config['servers'][server]['password']
 
 
 class DocumentImage:
