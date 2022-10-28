@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import argparse
 import base64
 import logging
 import os
@@ -47,45 +48,22 @@ except ImportError:
     print("The Pillow module is not installed.", sys.stderr)
     sys.exit(1)
 
-# get path to tesseract from config
-pytesseract.pytesseract.tesseract_cmd = config['tesseract-bin']
-
 # Set up logging
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-# create file handler which logs even debug messages
+
 # create console handler with a higher log level
-ch = logging.StreamHandler()
-ch.setLevel(logging.INFO)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
 # create formatter and add it to the handlers
 formatter = logging.Formatter('%(asctime)s - %(processName)s - %(levelname)s - %(message)s')
-ch.setFormatter(formatter)
+console_handler.setFormatter(formatter)
 # add the handlers to logger
-logger.addHandler(ch)
-
-# get uid of Odoo user
-with xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", allow_none=True, verbose=True,
-                               context=ssl._create_unverified_context()) as common:
-    uid = common.authenticate(db, username, password, {})
-    # Cleanup
-    del common
-
-
-def _config(config_file: str = '/etc/docscanner.conf', server_name: str = "development") -> yaml.SafeLoader:
-    with open(config_file) as f:
-        # global config
-        config: yaml.SafeLoader = yaml.safe_load(f)
-
-        # get login info from the config file
-        url = config['servers'][server]['url']
-        db = config['servers'][server]['database']
-        username = config['servers'][server]['username']
-        password = config['servers'][server]['password']
+logger.addHandler(console_handler)
 
 
 class DocumentImage:
 
-    def __init__(self, file):
+    def __init__(self, config: dict, file: object):
         """
         Class for all document images being processed by OCR
         :param file: The file to be processed
@@ -96,7 +74,8 @@ class DocumentImage:
         self.file: Path = file if type(file) == Path else Path(file)
         self._name: str = ""
         self.document_type = None
-        self._odoo_id: int = 0
+        self.odoo_id: int = 0
+        self.config = config
 
         for fileglob in config['document_type'].keys():
             if self.file.match(fileglob):
@@ -170,7 +149,7 @@ class DocumentImage:
         :rtype: str
         """
 
-        while self._name == "" and self.threshold_region_ignore >= config['documents'][self.document_type][
+        while self._name == "" and self.threshold_region_ignore >= self.config['documents'][self.document_type][
             'threshold_region_ignore_min']:
             name = self._read()
 
@@ -178,10 +157,10 @@ class DocumentImage:
             if name:
                 self._name = self.odoo_sequence + name
             else:
-                self.threshold_region_ignore -= config['documents'][self.document_type][
+                self.threshold_region_ignore -= self.config['documents'][self.document_type][
                     'threshold_region_ignore_decrement']
                 logger.info(
-                    f"{self.filename} can not be parsed. Changing OCR sensitivity {self.threshold_region_ignore + config['documents'][self.document_type]['threshold_region_ignore_decrement']} -> {self.threshold_region_ignore}."
+                    f"{self.filename} can not be parsed. Changing OCR sensitivity {self.threshold_region_ignore + self.config['documents'][self.document_type]['threshold_region_ignore_decrement']} -> {self.threshold_region_ignore}."
                 )
 
         return self._name
@@ -260,68 +239,202 @@ class DocumentImage:
         text = str(pytesseract.image_to_string(thresh1, config='--psm 6'))
         return text
 
-    @property
-    def odoo_id(self) -> int:
-        if self._odoo_id:
-            return self._odoo_id
 
+class OdooConnector:
+
+    def __init__(self, configuration: dict) -> None:
+        """
+        Connection Handler to communicate with Odoo
+        :param configuration:
+        :type configuration:
+        """
+        self.config: dict = configuration
+        self.url: str = self.config['url']
+        self.db: str = self.config['db']
+        self.username: str = self.config['username']
+        self.password: str = self.config['password']
+
+        self._uid = 0
+
+    def _get_uid(self):
+
+        try:
+            self._uid = self.config['uid']
+
+        except KeyError:
+
+            with xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/common", allow_none=True, verbose=self.config['debug'],
+                                           context=ssl._create_unverified_context()) as common:
+                self._uid = common.authenticate(self.db, self.username, self.password, {})
+
+                self.config['uid'] = self._uid
+
+        return self._uid
+
+    @property
+    def uid(self) -> int:
+        """
+        Odoo's user id for the username
+        :return: user id
+        :rtype: int
+        """
+        return self._uid or self._get_uid()
+
+    @uid.setter
+    def uid(self, user_id: int) -> None:
+        self._uid = user_id
+
+    def odoo_document_id(self, document: DocumentImage) -> int:
         retry: int = 0
-        while retry < config['retry']:
+        odoo_id: int = 0
+
+        while odoo_id == 0 and retry < self.config['retry']:
             try:
-                if self._odoo_id == 0 and self.name:
-                    with xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True,
-                                                   context=ssl._create_unverified_context()) as models:
-                        res = models.execute_kw(db, uid, password,
-                                                config['documents'][self.document_type]['odoo_object'],
-                                                'search_read', [[['name', '=', self.name]]],
-                                                {'fields': ['id', 'name']}
-                                                )
-                        if res and res[0]['name'] == self.name:
-                            self._odoo_id = res[0]['id']
-                else:
-                    break
+                with xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/object', allow_none=True,
+                                               context=ssl._create_unverified_context()) as models:
+                    res = models.execute_kw(self.db, self.uid, self.password,
+                                            self.config['documents'][document.document_type]['odoo_object'],
+                                            'search_read', [[['name', '=', document.name]]],
+                                            {'fields': ['id', 'name']}
+                                            )
+                    # If we get an id, set it in the document
+                    if res and res[0]['name'] == document.name:
+                        odoo_id = res[0]['id']
+                        logger.debug(f'File: {document.filename} Name: {document.name} has an Odoo ID of {odoo_id}')
+                        document.odoo_id = odoo_id
+                    else:
+                        break
             except Exception as e:
                 logger.error(e)
-                self._odoo_id = 0
+                odoo_id = 0
                 retry += 1
-                sleep(config['retry_sleep'])
+                sleep(self.config['retry_sleep'])
 
-        return self._odoo_id
+        return odoo_id
 
-    @odoo_id.setter
-    def odoo_id(self, odoo_id: int) -> None:
-        raise NotImplementedError("This field can not be set.")
-
-    def save(self) -> int:
+    def save_document(self, document: DocumentImage) -> int:
         retry: int = 0
-        while retry < config['retry']:
+        while retry < self.config['retry']:
             try:
-                if self.odoo_id:
-                    with xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object', allow_none=True,
+                # Make sure we have a document id from Odoo, if not, get one
+                if document.odoo_id or self.odoo_document_id(document):
+                    with xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/object', allow_none=True,
                                                    context=ssl._create_unverified_context()) as models:
-                        with self.file.open('rb') as f:
+                        with document.file.open('rb') as f:
                             data = base64.b64encode(f.read())
                             values = {
-                                'name': self.name.replace('/', '-') + '_' + self.filename.replace('/', '-'),
-                                'res_id': self.odoo_id,
-                                'res_model': config['documents'][self.document_type]['odoo_object'],
+                                'name': document.name.replace('/', '-') + '_' + document.filename.replace('/', '-'),
+                                'res_id': document.odoo_id,
+                                'res_model': self.config['documents'][document.document_type]['odoo_object'],
                                 'datas': data.decode('ascii')
                             }
-                            res = models.execute_kw(db, uid, password, 'ir.attachment', 'create', [values, ])
+                            res = models.execute_kw(self.db, self.uid, self.password, 'ir.attachment', 'create', [
+                                values, ])
 
                             return res
                 else:
+                    logger.error(
+                        f'Save failed: document {document.name} from file: {document.filename} can not be found in Odoo.')
                     break
 
             except Exception as e:
                 logger.error(e)
                 retry += 1
-                sleep(config['retry_sleep'])
+                sleep(self.config['retry_sleep'])
 
         return 0
 
 
+class FileManager:
+
+    def __init__(self, config: dict) -> None:
+        """
+        This class processes filenames given to its process_files() method
+
+        :param config: configuration data from the YAML config file returned by get_configuration()
+        :type config: dict
+        """
+
+        self.config = config
+
+    def document_generator(self, files: [str]) -> DocumentImage:
+        """
+        Returns a generator that yields a DocumentImage object for (hopefully) each file
+        or file glob passed
+
+        :param files: a list of files or file globs to process
+        :type files: list[str]
+        :return: generator for DocumentImage(s)
+        :rtype: DocumentImage
+        """
+        pass
+
+
+# def _environ_or_required(key):
+#     """Helper to ensure args are set or an ENV variable is present"""
+#     if os.environ.get(key):
+#         return {'default': os.environ.get(key)}
+#     else:
+#         return {'required': True}
+
+def _parse_args():
+    # Get configuration from environmental variables or command line
+    parser = argparse.ArgumentParser(description="Script to read scanned documents and send them to Odoo")
+
+    try:
+        parser.add_argument('-s', '--server', dest='server', default=os.environ.get("DS_SERVER",
+                                                                                    'production'),
+                            help="The server configuration to use from the config file")
+        parser.add_argument('-c', '--config', dest='config_file', default=os.environ.get("DS_CONFIG",
+                                                                                         "/etc/docscanner.conf"),
+                            help="The path to the YAML configuration file. Defaults to /etc/docscanner.conf")
+        parser.add_argument('-v', '--verbose', action='store_true', help="enable verbose output")
+        parser.add_argument('file', type=str, nargs='+',
+                            help="The file, files or directories to process (required)")
+
+        return parser.parse_args()
+
+    except Exception as e:
+        logger.error(e)
+        sys.exit(1)
+
+
+def get_configuration(config_file: object, server: str = "development") -> dict:
+    """
+    The configuration read from a YAML file
+    :param config_file: the configuration file, either as pathlib.Path or str
+    :type config_file: object
+    :param server: the server configuration to use from the [servers] section
+    :type server: str
+    :return: dictionary of configuration settings
+    :rtype: dict
+    """
+
+    config_file: Path = config_file if type(config_file) == Path else Path(config_file)
+    server: str = server
+
+    with open(config_file) as f:
+        # global config
+        config: dict = yaml.safe_load(f)
+
+        # get login info from the config config_file
+        config['url'] = config['servers'][server]['url']
+        config['db'] = config['servers'][server]['database']
+        config['username'] = config['servers'][server]['username']
+        config['password'] = config['servers'][server]['password']
+
+        config['debug'] = False
+
+        return config
+
+
 def main():
+    args = _parse_args()
+    config = get_configuration(args.config_file, args.server)
+    config.debug = args.debug
+
+    # get path to tesseract from config
+    pytesseract.pytesseract.tesseract_cmd = config['tesseract-bin']
     path = Path(sys.argv[1])
     done_path = Path(str(path) + '/done')
     done_path.mkdir(exist_ok=True)
