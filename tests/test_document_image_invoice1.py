@@ -18,7 +18,7 @@ class TestGetConfiguration(TestCase):
     def test_function_get_configuration(self) -> None:
         config = get_configuration(self.config_file_name, self.server)
 
-        self.assertEqual("ppt-apps15-20220920", config['db'])
+        self.assertEqual("ppt-apps15-20221028", config['db'])
         self.assertEqual("/usr/bin/tesseract", config['tesseract-bin'])
         self.assertEqual("account.move", config['documents']['Invoice']['odoo_object'])
 
@@ -55,11 +55,26 @@ class TestOdooConnector(TestCase):
 class TestFileManager(TestCase):
 
     def setUp(self) -> None:
-        self.config = docscanner.get_configuration("./test_config.yaml", "development")
+        self.config = docscanner.get_configuration("./test_config.yaml", "development", True)
 
     def test_construction(self):
         self.assertIsInstance(FileManager(self.config), FileManager)
 
+    def test_get_paths_from_string(self):
+
+        fmgr: FileManager = FileManager(self.config)
+
+        arg1: str = "."
+        arg2: str = "./1-Customer_Invoice-INV-2022-11528.jpg"
+        arg3: str = "*.jpg"
+        arg4: str = "*.foo"
+
+        self.assertEqual([f for f in Path(arg1).iterdir() if f.is_file()], fmgr._get_paths_from_string(arg1))
+        self.assertEqual([Path(arg2), ], fmgr._get_paths_from_string(arg2))
+        self.assertEqual([f for f in Path(arg3).parent.glob("*.jpg") if f.is_file()], fmgr._get_paths_from_string(arg3))
+
+        # Test logger.warning
+        fmgr._get_paths_from_string(arg4)
     def test_document_generator_files(self):
         mgr = FileManager(self.config)
 
@@ -72,6 +87,8 @@ class TestFileManager(TestCase):
 class TestInvoice(TestCase):
 
     def setUp(self) -> None:
+
+        self.config = docscanner.get_configuration("./test_config.yaml", "development")
         self.test_invoice_file = "1-Customer_Invoice-INV-2022-11528.jpg"
         self.test_invoice_name = "INV/2022/11528"
         self.odoo_id = 100
@@ -82,14 +99,14 @@ class TestInvoice(TestCase):
         :return: None
         :rtype: None
         """
-        assert DocumentImage(self.test_invoice_file)
-        self.invoice = DocumentImage(self.test_invoice_file)
+        assert DocumentImage(self.config, self.test_invoice_file)
+        self.invoice = DocumentImage(self.config, self.test_invoice_file)
         self.assertEqual(self.invoice.file, Path(self.test_invoice_file))
         self.assertEqual(self.invoice.filename, self.test_invoice_file)
         self.assertEqual(self.invoice.document_type, "Invoice")
         self.assertEqual(self.invoice.threshold_region_ignore, 80)
         self.assertTrue(self.invoice.regex.search(self.test_invoice_name))
-        self.assertListEqual(self.invoice._regions_list, [[1, 2, 3, 4], [5, 6, 7, 8]])
+        self.assertListEqual(self.invoice._regions_list, [[1, 2, 3, 4], [5, 6, 7, 8, 9]])
         print(self.shortDescription())
 
     def test__mark_region(self):
@@ -102,11 +119,11 @@ class TestInvoice(TestCase):
         :rtype: None
         """
         print(self.shortDescription())
-        invoice: DocumentImage = DocumentImage(self.test_invoice_file)
+        invoice: DocumentImage = DocumentImage(self.config, self.test_invoice_file)
         image, line_items_coordinates = invoice._mark_region()
 
         # Read the 6th region from the top and compare to what it should be
-        self.assertEqual(invoice._read_text(image, line_items_coordinates, -6), "Draft Invoice INV/2022/12412\n")
+        self.assertEqual(invoice._read_text(image, line_items_coordinates, -7), f"Draft Invoice {self.test_invoice_name}\n")
 
     def test__read(self):
         """
@@ -115,7 +132,7 @@ class TestInvoice(TestCase):
         :rtype: None
         """
         print(self.shortDescription())
-        invoice = DocumentImage(self.test_invoice_file)
+        invoice = DocumentImage(self.config, self.test_invoice_file)
         self.assertEqual(self.test_invoice_name.lstrip('INV'), invoice._read())
 
     def test_name(self):
@@ -125,7 +142,7 @@ class TestInvoice(TestCase):
        :rtype: None
        """
         print(self.shortDescription())
-        invoice = DocumentImage(self.test_invoice_file)
+        invoice = DocumentImage(self.config, self.test_invoice_file)
         self.assertEqual(self.test_invoice_name, invoice.name)
 
     def test_name_setter(self):
@@ -135,7 +152,7 @@ class TestInvoice(TestCase):
         :rtype: None
         """
         print(self.shortDescription())
-        invoice = DocumentImage(self.test_invoice_file)
+        invoice = DocumentImage(self.config, self.test_invoice_file)
         with self.assertRaises(NotImplementedError):
             invoice.name = "Test"
 
@@ -146,7 +163,7 @@ class TestInvoice(TestCase):
          :rtype: None
          """
         print(self.shortDescription())
-        invoice = DocumentImage(self.test_invoice_file)
+        invoice = DocumentImage(self.config, self.test_invoice_file)
         self.assertEqual(invoice.name, self.test_invoice_name)
         invoice.reset()
         self.assertEqual(invoice._name, "")
@@ -155,9 +172,9 @@ class TestInvoice(TestCase):
         self.assertEqual(invoice.name, self.test_invoice_name)
 
     def test_odoo_sequence(self):
-        invoice = DocumentImage(self.test_invoice_file)
+        invoice = DocumentImage(self.config, self.test_invoice_file)
         self.assertEqual("INV", invoice.odoo_sequence)
 
     def test_odoo_id(self):
-        invoice = DocumentImage(self.test_invoice_file)
-        self.assertEqual(self.odoo_id, invoice.odoo_id)
+        invoice = DocumentImage(self.config, self.test_invoice_file)
+        self.assertEqual(invoice.odoo_id, 0)

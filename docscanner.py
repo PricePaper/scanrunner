@@ -357,6 +357,35 @@ class FileManager:
 
         self.config = config
 
+    def _get_paths_from_string(self, path_string: str) -> [Path]:
+        """
+        Takes a string and figures out how to make Path objects from it. Handles directories as well as file globs.
+        :param path_string: directory, file or file glob as string
+        :return: List[Path]
+        """
+        path = Path(path_string)
+        paths: [Path] = []
+
+        try:
+            # Glob returns a generator. If the generator throws a ValueError, we don't have a file glob
+            paths.extend([f for f in path.parent.glob(path.name) if f.is_file()])
+
+            # if that worked, we know it's an iterable, and therefore a valid file glob
+            return paths
+
+        except ValueError:
+            logger.debug(f"{path_string} is not a file glob")
+
+        if path.is_dir():
+            logger.debug(f"{path_string} is a directory")
+            paths = [file for file in path.iterdir() if file.is_file()]
+        elif path.is_file():
+            logger.debug(f"{path_string} is a regular file")
+            paths.append(path)
+        else:
+            logger.warning(f"{path_string} is not a directory, regular file or file glob. Ignoring.")
+
+        return paths
     def document_generator(self, files: [str]) -> DocumentImage:
         """
         Returns a generator that yields a DocumentImage object for (hopefully) each file
@@ -399,7 +428,7 @@ def _parse_args():
         sys.exit(1)
 
 
-def get_configuration(config_file: object, server: str = "development") -> dict:
+def get_configuration(config_file: object, server: str = "development", debug: bool = False) -> dict:
     """
     The configuration read from a YAML file
     :param config_file: the configuration file, either as pathlib.Path or str
@@ -423,7 +452,10 @@ def get_configuration(config_file: object, server: str = "development") -> dict:
         config['username'] = config['servers'][server]['username']
         config['password'] = config['servers'][server]['password']
 
-        config['debug'] = False
+        config['debug'] = debug
+
+        if debug:
+            console_handler.setLevel(logging.DEBUG)
 
         return config
 
