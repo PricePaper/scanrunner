@@ -487,7 +487,8 @@ def _parse_args():
 def get_configuration(config_file_name: str, server: str = "development", debug: bool = False,
                       stats: bool = False) -> dict:
     """
-    The configuration read from a YAML file
+    The configuration read from a YAML file and various other housekeeping such as setting up logging.
+
     :param debug: Turns on debug logging
     :type debug: bool
     :param config_file: the configuration file, either as pathlib.Path or str
@@ -550,8 +551,7 @@ def main():
     args = _parse_args()
     config = get_configuration(args.config_file, args.server, args.debug, args.stats)
 
-    # Set up logging
-    logger = logging.getLogger()
+    logger = config['logger']
 
     # get path to tesseract from config
     pytesseract.pytesseract.tesseract_cmd = config['tesseract-bin']
