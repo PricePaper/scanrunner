@@ -114,10 +114,9 @@ class DocumentImage:
                 try:
                     t: str = self._read_text(image, line_items_coordinates, -i).replace('\n', ' ')
                     self.logger.debug(f'Region: {i} document string: {document_str}')
-                    m = self.regex.search(t)
+                    m: re.Match = self.regex.search(t)
                     document_str = m.group(1)
                     if document_str:
-                        #stats: dict[int:str] = self.config['statistics'][self.document_type] or {}
                         count: int = self.config['statistics'][self.document_type].setdefault(i, 0) + 1
                         self.config['statistics'][self.document_type][i] = count
                         return document_str
@@ -319,9 +318,10 @@ class OdooConnector:
                                             {'fields': ['id', 'name']}
                                             )
                     # If we get an id, set it in the document
-                    if res and res[0]['name'] == document.name:
+                    if type(res) == list and res[0]['name'] == document.name:
                         odoo_id = res[0]['id']
-                        self.logger.debug(f'File: {document.filename} Name: {document.name} has an Odoo ID of {odoo_id}')
+                        self.logger.debug(
+                            f'File: {document.filename} Name: {document.name} has an Odoo ID of {odoo_id}')
                         document.odoo_id = odoo_id
                     else:
                         break
@@ -379,14 +379,14 @@ class FileManager:
         self.config = config
         self.logger: logging.Logger = config['logger']
 
-    def _get_paths_from_string(self, path_string: str) -> [Path]:
+    def _get_paths_from_string(self, path_string: str) -> typing.List[Path]:
         """
         Takes a string and figures out how to make Path objects from it. Handles directories as well as file globs.
         :param path_string: directory, file or file glob as string
         :return: List[Path]
         """
         path = Path(path_string)
-        paths: [Path] = []
+        paths: typing.List[Path] = []
 
         try:
             # Glob returns a generator. If the generator throws a ValueError, we don't have a file glob
@@ -409,7 +409,7 @@ class FileManager:
 
         return paths
 
-    def document_generator(self, paths: [str]) -> typing.Generator[DocumentImage, None, None]:
+    def document_generator(self, paths: typing.List[str]) -> typing.Generator[DocumentImage, None, None]:
         """
         Returns a generator that yields a DocumentImage object for (hopefully) each file
         or file glob passed
@@ -420,7 +420,7 @@ class FileManager:
         :rtype: typing.Generator[DocumentImage]
         """
 
-        files_list: [Path] = []
+        files_list: typing.List[Path] = []
 
         for path in paths:
             files_list.extend(self._get_paths_from_string(path))
@@ -491,7 +491,7 @@ def _parse_args():
         sys.exit(1)
 
 
-def get_configuration(config_file: object, server: str = "development", debug: bool = False,
+def get_configuration(config_file_name: str, server: str = "development", debug: bool = False,
                       stats: bool = False) -> dict:
     """
     The configuration read from a YAML file
@@ -505,10 +505,9 @@ def get_configuration(config_file: object, server: str = "development", debug: b
     :rtype: dict
     """
 
-    config_file: Path = config_file if type(config_file) == Path else Path(config_file)
-    server: str = server
+    config_file: Path = Path(config_file_name)
 
-    with open(config_file) as f:
+    with config_file.open() as f:
         # global config
         config: dict = yaml.safe_load(f)
 
@@ -523,14 +522,15 @@ def get_configuration(config_file: object, server: str = "development", debug: b
         # Set up statistics, if needed
         if stats:
             stats_file = Path(config['statistics-file'])
+            statistics: dict
             if stats_file.exists():
-                statistics: dict = yaml.safe_load(stats_file.read_text()) or {}
+                statistics = yaml.safe_load(stats_file.read_text()) or {}
 
                 for doc_type in config['documents']:
                     if not statistics.setdefault(doc_type, 0):
                         statistics[doc_type] = {}
             else:
-                statistics: dict = {doc_type: {} for doc_type in config['documents']}
+                statistics = {doc_type: {} for doc_type in config['documents']}
                 with open(str(stats_file), 'w') as f:
                     yaml.safe_dump(statistics, f)
             config['statistics'] = statistics
