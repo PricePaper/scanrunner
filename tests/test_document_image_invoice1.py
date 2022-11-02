@@ -6,6 +6,7 @@ import docscanner
 from docscanner import *
 
 docscanner.console_handler.setLevel(logging.DEBUG)
+docscanner.logger.addHandler(docscanner.console_handler)
 
 
 class TestGetConfiguration(TestCase):
@@ -55,6 +56,8 @@ class TestOdooConnector(TestCase):
 class TestFileManager(TestCase):
 
     def setUp(self) -> None:
+        self.test_invoice_file = "1-Customer_Invoice-INV-2022-11528.jpg"
+        self.test_invoice_name = "INV/2022/11528"
         self.config = docscanner.get_configuration("./test_config.yaml", "development", True)
 
     def test_construction(self):
@@ -75,19 +78,62 @@ class TestFileManager(TestCase):
 
         # Test logger.warning
         fmgr._get_paths_from_string(arg4)
+
     def test_document_generator_files(self):
         mgr = FileManager(self.config)
 
         files: [str] = ["./1-Customer_Invoice-INV-2022-11528.jpg",
                         "2-Customer_Invoice-INV-2022-10515-2.jpg"]
 
+        names: [str] = ["INV/2022/11528",
+                        "INV/2022/10515"]
+
         documents = mgr.document_generator(files)
 
+        i: int = 0
+        for doc in documents:
+            self.assertEqual(doc.file, Path(files[i]))
+            self.assertEqual(doc.name, names[i])
+            i += 1
+
+    def test_document_generator_glob(self):
+        mgr = FileManager(self.config)
+
+        glob: [str] = ["*.png", "*.jpg"]
+
+        names: [str] = ["INV/2022/11528", "INV/2022/11528", "INV/2022/10515"]
+
+        documents = mgr.document_generator(glob)
+
+        i: int = 0
+        for doc in documents:
+            self.assertEqual(doc.name, names[i])
+            i += 1
+
+    def test_done(self):
+        """
+        Testing moving a Document to its done location
+        :return: None
+        :rtype: None
+        """
+        mgr = FileManager(self.config)
+
+        document = DocumentImage(self.config, self.test_invoice_file)
+        original_file = document.file
+
+        print(f"{self.shortDescription()} original file:{document.filename}")
+
+        mgr.done(document)
+
+        self.assertTrue(document.file.exists())
+        print(f"{self.shortDescription()} done file:{document.filename}")
+
+        # reset file move
+        document.file.replace(original_file)
 
 class TestInvoice(TestCase):
 
     def setUp(self) -> None:
-
         self.config = docscanner.get_configuration("./test_config.yaml", "development")
         self.test_invoice_file = "1-Customer_Invoice-INV-2022-11528.jpg"
         self.test_invoice_name = "INV/2022/11528"
@@ -109,6 +155,13 @@ class TestInvoice(TestCase):
         self.assertListEqual(self.invoice._regions_list, [[1, 2, 3, 4], [5, 6, 7, 8, 9]])
         print(self.shortDescription())
 
+    def test_get_document_type(self):
+        document = DocumentImage(self.config, self.test_invoice_file)
+
+        doc_type: str = document.document_type
+
+        self.assertEqual(doc_type, "Invoice")
+
     def test__mark_region(self):
         pass
 
@@ -123,7 +176,8 @@ class TestInvoice(TestCase):
         image, line_items_coordinates = invoice._mark_region()
 
         # Read the 6th region from the top and compare to what it should be
-        self.assertEqual(invoice._read_text(image, line_items_coordinates, -7), f"Draft Invoice {self.test_invoice_name}\n")
+        self.assertEqual(invoice._read_text(image, line_items_coordinates, -7),
+                         f"Draft Invoice {self.test_invoice_name}\n")
 
     def test__read(self):
         """

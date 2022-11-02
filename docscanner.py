@@ -7,6 +7,7 @@ import os
 import re
 import ssl
 import sys
+import typing
 import xmlrpc.client
 from pathlib import Path
 from time import sleep
@@ -48,17 +49,7 @@ except ImportError:
     print("The Pillow module is not installed.", sys.stderr)
     sys.exit(1)
 
-# Set up logging
-logger = logging.getLogger()
 
-# create console handler with a higher log level
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-# create formatter and add it to the handlers
-formatter = logging.Formatter('%(asctime)s - %(processName)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
-# add the handlers to logger
-logger.addHandler(console_handler)
 
 
 class DocumentImage:
@@ -73,18 +64,11 @@ class DocumentImage:
         # if we're passed a string, convert to Path
         self.file: Path = file if type(file) == Path else Path(file)
         self._name: str = ""
-        self.document_type = None
+        self._document_type = ""
         self.odoo_id: int = 0
+        self.odoo_attachment_id: int = 0
         self.config = config
-
-        for fileglob in config['document_type'].keys():
-            if self.file.match(fileglob):
-                self.document_type = config['document_type'][fileglob]
-
-        # self.document_type:str = [config['file_type'][fileglob] for
-        #                   fileglob in config['document_type']
-        #                   if self.file.match(config['document_type'][fileglob])
-        #                   ][0]
+        self.logger = config['logger']
 
         self._odoo_sequence: str = config['documents'][self.document_type]['odoo_sequence']
         self._threshold_region_ignore: int = config['documents'][self.document_type]['threshold_region_ignore']
@@ -121,7 +105,7 @@ class DocumentImage:
         :rtype: None
         """
 
-        invoice: str = ''
+        document_str: str = ''
         image, line_items_coordinates = self._mark_region()
 
         # the invoice number usually lives in regions -1 to -3
@@ -129,16 +113,52 @@ class DocumentImage:
             for i in regions:
                 try:
                     t: str = self._read_text(image, line_items_coordinates, -i).replace('\n', ' ')
-                    logger.debug(f'Region: {i} Invoice: {invoice}')
+                    self.logger.debug(f'Region: {i} document string: {document_str}')
                     m = self.regex.search(t)
-                    invoice = m.group(1)
+                    document_str = m.group(1)
+                    if document_str:
+                        #stats: dict[int:str] = self.config['statistics'][self.document_type] or {}
+                        count: int = self.config['statistics'][self.document_type].setdefault(i, 0) + 1
+                        self.config['statistics'][self.document_type][i] = count
+                        return document_str
 
-                except IndexError:
-                    break
-                except Exception:
-                    pass
+                except Exception as e:
+                    continue
 
-        return invoice
+        return document_str
+
+    @property
+    def document_type(self) -> str:
+        """
+        Using the file name, and mime type from the config file, this method determines the
+        correct document type to be used for further processing of the file
+        :return: the document type as defined in the configuration file
+        :rtype: str
+        """
+
+        if self._document_type:
+            return self._document_type
+
+        for document, values in self.config['documents'].items():
+
+            if self.file.match(values['file-name-match']):
+                mime_type = magic.from_file(self.filename, mime=True)
+                if mime_type in values['mime-types']:
+                    self.logger.debug(f"File: {self.filename} mime-type: {mime_type} document-type: {document}")
+                    self._document_type = document
+
+        return self._document_type
+
+    @document_type.setter
+    def document_type(self, document_type: str) -> None:
+        """
+        Sets the document type. This would not normally be used.
+        :param document_type:
+        :type document_type: str
+        :return: None
+        :rtype: None
+        """
+        self._document_type = document_type
 
     @property
     def name(self) -> str:
@@ -159,7 +179,7 @@ class DocumentImage:
             else:
                 self.threshold_region_ignore -= self.config['documents'][self.document_type][
                     'threshold_region_ignore_decrement']
-                logger.info(
+                self.logger.debug(
                     f"{self.filename} can not be parsed. Changing OCR sensitivity {self.threshold_region_ignore + self.config['documents'][self.document_type]['threshold_region_ignore_decrement']} -> {self.threshold_region_ignore}."
                 )
 
@@ -253,6 +273,7 @@ class OdooConnector:
         self.db: str = self.config['db']
         self.username: str = self.config['username']
         self.password: str = self.config['password']
+        self.logger: logging.Logger = configuration['logger']
 
         self._uid = 0
 
@@ -300,12 +321,12 @@ class OdooConnector:
                     # If we get an id, set it in the document
                     if res and res[0]['name'] == document.name:
                         odoo_id = res[0]['id']
-                        logger.debug(f'File: {document.filename} Name: {document.name} has an Odoo ID of {odoo_id}')
+                        self.logger.debug(f'File: {document.filename} Name: {document.name} has an Odoo ID of {odoo_id}')
                         document.odoo_id = odoo_id
                     else:
                         break
             except Exception as e:
-                logger.error(e)
+                self.logger.exception("There was a problem getting the document id from Odoo")
                 odoo_id = 0
                 retry += 1
                 sleep(self.config['retry_sleep'])
@@ -328,17 +349,17 @@ class OdooConnector:
                                 'res_model': self.config['documents'][document.document_type]['odoo_object'],
                                 'datas': data.decode('ascii')
                             }
-                            res = models.execute_kw(self.db, self.uid, self.password, 'ir.attachment', 'create', [
-                                values, ])
+                            document.odoo_attachment_id = models.execute_kw(self.db, self.uid, self.password,
+                                                                            'ir.attachment', 'create', [values, ])
 
-                            return res
+                            return document.odoo_attachment_id
                 else:
-                    logger.error(
+                    self.logger.error(
                         f'Save failed: document {document.name} from file: {document.filename} can not be found in Odoo.')
                     break
 
             except Exception as e:
-                logger.error(e)
+                self.logger.error(e)
                 retry += 1
                 sleep(self.config['retry_sleep'])
 
@@ -356,6 +377,7 @@ class FileManager:
         """
 
         self.config = config
+        self.logger: logging.Logger = config['logger']
 
     def _get_paths_from_string(self, path_string: str) -> [Path]:
         """
@@ -374,32 +396,71 @@ class FileManager:
             return paths
 
         except ValueError:
-            logger.debug(f"{path_string} is not a file glob")
+            self.logger.debug(f"{path_string} is not a file glob")
 
         if path.is_dir():
-            logger.debug(f"{path_string} is a directory")
+            self.logger.debug(f"{path_string} is a directory")
             paths = [file for file in path.iterdir() if file.is_file()]
         elif path.is_file():
-            logger.debug(f"{path_string} is a regular file")
+            self.logger.debug(f"{path_string} is a regular file")
             paths.append(path)
         else:
-            logger.warning(f"{path_string} is not a directory, regular file or file glob. Ignoring.")
+            self.logger.warning(f"{path_string} is not a directory, regular file or file glob. Ignoring.")
 
         return paths
-    def document_generator(self, files: [str]) -> DocumentImage:
+
+    def document_generator(self, paths: [str]) -> typing.Generator[DocumentImage, None, None]:
         """
         Returns a generator that yields a DocumentImage object for (hopefully) each file
         or file glob passed
 
-        :param files: a list of files or file globs to process
-        :type files: list[str]
+        :param paths: a list of files or file globs to process
+        :type paths: list[str]
         :return: generator for DocumentImage(s)
-        :rtype: DocumentImage
+        :rtype: typing.Generator[DocumentImage]
         """
-        pass
+
+        files_list: [Path] = []
+
+        for path in paths:
+            files_list.extend(self._get_paths_from_string(path))
+
+        for document in files_list:
+            yield DocumentImage(self.config, document)
+
+    def done(self, document: DocumentImage) -> str:
+
+        done_top_dir: Path = Path(f"{document.file.parent}/{self.config['done-path']}")
+
+        doc_type: str
+        doc_year: str
+        doc_number: str
+        doc_type, doc_year, doc_number = document.name.split('/')
+
+        # Group documents by 100 to ease speed file access
+        doc_grouping: int = int(doc_number) // 100
+
+        done_path = done_top_dir.joinpath(f"{doc_type}/{doc_year}/{doc_grouping:02}00")
+
+        # Make the directory if it doesn't exist, including parent directories
+        done_path.mkdir(exist_ok=True, parents=True)
+
+        if not document.odoo_id or not document.odoo_attachment_id:
+            self.logger.warning(f"Document {document.name} file:{document.filename} is not saved to Odoo")
+
+        new_file_name = f"{document.name.replace('/', '-')}_id-{document.odoo_id}_aid-{document.odoo_attachment_id}_{document.filename}"
+
+        self.logger.debug(f"Targeting {new_file_name} for file {document.filename}")
+
+        document.file = document.file.replace(done_path.joinpath(new_file_name))
+
+        self.logger.info(f"Moved {document.name} -> {document.filename}")
+
+        return document.filename
+
+    # def _environ_or_required(key):
 
 
-# def _environ_or_required(key):
 #     """Helper to ensure args are set or an ENV variable is present"""
 #     if os.environ.get(key):
 #         return {'default': os.environ.get(key)}
@@ -417,20 +478,25 @@ def _parse_args():
         parser.add_argument('-c', '--config', dest='config_file', default=os.environ.get("DS_CONFIG",
                                                                                          "/etc/docscanner.conf"),
                             help="The path to the YAML configuration file. Defaults to /etc/docscanner.conf")
-        parser.add_argument('-v', '--verbose', action='store_true', help="enable verbose output")
+        parser.add_argument('-v', '--verbose', dest='debug', action='store_true', help="enable verbose output")
+        parser.add_argument('--stats', action='store_true', help="store region statistics in file")
         parser.add_argument('file', type=str, nargs='+',
-                            help="The file, files or directories to process (required)")
+                            help="The file, files or directories to process. Can be more than one. (required)")
 
         return parser.parse_args()
 
     except Exception as e:
-        logger.error(e)
+        logger = logging.getLogger()
+        logger.exception("Exception while parsing command line arguments.")
         sys.exit(1)
 
 
-def get_configuration(config_file: object, server: str = "development", debug: bool = False) -> dict:
+def get_configuration(config_file: object, server: str = "development", debug: bool = False,
+                      stats: bool = False) -> dict:
     """
     The configuration read from a YAML file
+    :param debug: Turns on debug logging
+    :type debug: bool
     :param config_file: the configuration file, either as pathlib.Path or str
     :type config_file: object
     :param server: the server configuration to use from the [servers] section
@@ -454,22 +520,55 @@ def get_configuration(config_file: object, server: str = "development", debug: b
 
         config['debug'] = debug
 
-        if debug:
-            console_handler.setLevel(logging.DEBUG)
+        # Set up statistics, if needed
+        if stats:
+            stats_file = Path(config['statistics-file'])
+            if stats_file.exists():
+                statistics: dict = yaml.safe_load(stats_file.read_text()) or {}
+
+                for doc_type in config['documents']:
+                    if not statistics.setdefault(doc_type, 0):
+                        statistics[doc_type] = {}
+            else:
+                statistics: dict = {doc_type: {} for doc_type in config['documents']}
+                with open(str(stats_file), 'w') as f:
+                    yaml.safe_dump(statistics, f)
+            config['statistics'] = statistics
+
+            logger = logging.getLogger()
+
+            if debug:
+                logger.setLevel(logging.DEBUG)
+            else:
+                logger.setLevel(logging.INFO)
+
+            # create console handler with a higher log level
+            console_handler = logging.StreamHandler()
+            if debug:
+                console_handler.setLevel(logging.DEBUG)
+            else:
+                console_handler.setLevel(logging.INFO)
+            # create formatter and add it to the handlers
+            formatter = logging.Formatter('%(asctime)s - %(processName)s - %(levelname)s - %(message)s')
+            console_handler.setFormatter(formatter)
+            # add the handlers to logger
+            logger.addHandler(console_handler)
+            config['logger'] = logger
 
         return config
 
 
 def main():
     args = _parse_args()
-    config = get_configuration(args.config_file, args.server)
-    config.debug = args.debug
+    config = get_configuration(args.config_file, args.server, args.debug, args.stats)
+
+    # Set up logging
+    logger = logging.getLogger()
+
+
 
     # get path to tesseract from config
     pytesseract.pytesseract.tesseract_cmd = config['tesseract-bin']
-    path = Path(sys.argv[1])
-    done_path = Path(str(path) + '/done')
-    done_path.mkdir(exist_ok=True)
 
     # Improve OCR by increasing threads to max cpus minus one
     try:
@@ -478,26 +577,24 @@ def main():
     except AttributeError:
         os.environ['OMP_THREAD_LIMIT'] = str((psutil.cpu_count() - 1) or 1)
 
-    # for filename in path.glob('*.png'):
-    for filename in path.glob('*.jpg'):
-        res = 0
-        invoice: DocumentImage = DocumentImage(filename)
-        if invoice.odoo_id and invoice.name:
-            try:
-                res = invoice.save()
-            except Exception as e:
-                logger.error(e)
+    # get our manager objects
+    file_manager: FileManager = FileManager(config)
+    odoo: OdooConnector = OdooConnector(config)
 
-            if res:
-                logger.info(f"Moving {invoice.filename} to {done_path}")
-                filename.rename(
-                    done_path.joinpath(
-                        f"{invoice.name.replace('/', '-')}_{invoice.odoo_id}_{invoice.filename.replace('/', '-')}"))
+    # Get the documents
+    documents: typing.Generator[DocumentImage, None, None] = file_manager.document_generator(args.file)
+
+    for document in documents:
+        if odoo.save_document(document):
+            logger.info(f"Saved {document.name} ID: {document.odoo_id} to odoo server: {args.server}")
+            file_manager.done(document)
         else:
-            if invoice.name:
-                # filename.replace(invoice.name.replace('/', '-') + '_' + invoice.filename.replace('/', '-'))
-                logger.warning(f"{invoice.name or invoice.filename} can not be processed at this time.")
+            logger.error(f"Unable to process file: {document.filename}. SKIPPING.")
 
+    # Save statistics before we exit
+    if args.stats:
+        with open(config['statistics-file'], 'w') as f:
+            yaml.safe_dump(config['statistics'], f)
 
 if __name__ == "__main__":
     main()
