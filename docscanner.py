@@ -50,8 +50,6 @@ except ImportError:
     sys.exit(1)
 
 
-
-
 class DocumentImage:
 
     def __init__(self, config: dict, file: object):
@@ -179,8 +177,7 @@ class DocumentImage:
                 self.threshold_region_ignore -= self.config['documents'][self.document_type][
                     'threshold_region_ignore_decrement']
                 self.logger.debug(
-                    f"{self.filename} can not be parsed. Changing OCR sensitivity {self.threshold_region_ignore + self.config['documents'][self.document_type]['threshold_region_ignore_decrement']} -> {self.threshold_region_ignore}."
-                )
+                    f"{self.filename} can not be parsed. Changing OCR sensitivity {self.threshold_region_ignore + self.config['documents'][self.document_type]['threshold_region_ignore_decrement']} -> {self.threshold_region_ignore}.")
 
         return self._name
 
@@ -314,9 +311,7 @@ class OdooConnector:
                                                context=ssl._create_unverified_context()) as models:
                     res = models.execute_kw(self.db, self.uid, self.password,
                                             self.config['documents'][document.document_type]['odoo_object'],
-                                            'search_read', [[['name', '=', document.name]]],
-                                            {'fields': ['id', 'name']}
-                                            )
+                                            'search_read', [[['name', '=', document.name]]], {'fields': ['id', 'name']})
                     # If we get an id, set it in the document
                     if type(res) == list and res[0]['name'] == document.name:
                         odoo_id = res[0]['id']
@@ -347,8 +342,7 @@ class OdooConnector:
                                 'name': document.name.replace('/', '-') + '_' + document.filename.replace('/', '-'),
                                 'res_id': document.odoo_id,
                                 'res_model': self.config['documents'][document.document_type]['odoo_object'],
-                                'datas': data.decode('ascii')
-                            }
+                                'datas': data.decode('ascii')}
                             document.odoo_attachment_id = models.execute_kw(self.db, self.uid, self.password,
                                                                             'ir.attachment', 'create', [values, ])
 
@@ -472,11 +466,10 @@ def _parse_args():
     parser = argparse.ArgumentParser(description="Script to read scanned documents and send them to Odoo")
 
     try:
-        parser.add_argument('-s', '--server', dest='server', default=os.environ.get("DS_SERVER",
-                                                                                    'production'),
+        parser.add_argument('-s', '--server', dest='server', default=os.environ.get("DS_SERVER", 'production'),
                             help="The server configuration to use from the config file")
-        parser.add_argument('-c', '--config', dest='config_file', default=os.environ.get("DS_CONFIG",
-                                                                                         "/etc/docscanner.conf"),
+        parser.add_argument('-c', '--config', dest='config_file',
+                            default=os.environ.get("DS_CONFIG", "/etc/docscanner.conf"),
                             help="The path to the YAML configuration file. Defaults to /etc/docscanner.conf")
         parser.add_argument('-v', '--verbose', dest='debug', action='store_true', help="enable verbose output")
         parser.add_argument('--stats', action='store_true', help="store region statistics in file")
@@ -537,23 +530,18 @@ def get_configuration(config_file_name: str, server: str = "development", debug:
 
             logger = logging.getLogger()
 
-            if debug:
-                logger.setLevel(logging.DEBUG)
-            else:
-                logger.setLevel(logging.INFO)
-
-            # create console handler with a higher log level
-            console_handler = logging.StreamHandler()
-            if debug:
-                console_handler.setLevel(logging.DEBUG)
-            else:
-                console_handler.setLevel(logging.INFO)
-            # create formatter and add it to the handlers
-            formatter = logging.Formatter('%(asctime)s - %(processName)s - %(levelname)s - %(message)s')
-            console_handler.setFormatter(formatter)
-            # add the handlers to logger
-            logger.addHandler(console_handler)
-            config['logger'] = logger
+        # create console handler with a higher log level
+        console_handler = logging.StreamHandler()
+        if debug:
+            console_handler.setLevel(logging.DEBUG)
+        else:
+            console_handler.setLevel(logging.INFO)
+        # create formatter and add it to the handlers
+        formatter = logging.Formatter('%(asctime)s - %(processName)s - %(levelname)s - %(message)s')
+        console_handler.setFormatter(formatter)
+        # add the handlers to logger
+        logger.addHandler(console_handler)
+        config['logger'] = logger
 
         return config
 
@@ -564,8 +552,6 @@ def main():
 
     # Set up logging
     logger = logging.getLogger()
-
-
 
     # get path to tesseract from config
     pytesseract.pytesseract.tesseract_cmd = config['tesseract-bin']
@@ -595,6 +581,7 @@ def main():
     if args.stats:
         with open(config['statistics-file'], 'w') as f:
             yaml.safe_dump(config['statistics'], f)
+
 
 if __name__ == "__main__":
     main()
