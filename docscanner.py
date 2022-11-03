@@ -306,6 +306,9 @@ class OdooConnector:
         odoo_id: int = 0
 
         while odoo_id == 0 and retry < self.config['retry']:
+            if not document.name:
+                self.logger.warning(f"Unable to read document name from {document.filename}. SKIPPING")
+                return odoo_id
             try:
                 with xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/object', allow_none=True,
                                                context=ssl._create_unverified_context()) as models:
@@ -420,7 +423,11 @@ class FileManager:
             files_list.extend(self._get_paths_from_string(path))
 
         for document in files_list:
-            yield DocumentImage(self.config, document)
+            try:
+                yield DocumentImage(self.config, document)
+            except Exception as e:
+               self.logger.warning(f"Unable to parse file {document}. IGNORING.")
+               continue
 
     def done(self, document: DocumentImage) -> str:
 
@@ -529,7 +536,8 @@ def get_configuration(config_file_name: str, server: str = "development", debug:
                     yaml.safe_dump(statistics, f)
             config['statistics'] = statistics
 
-            logger = logging.getLogger()
+        # Get root logger
+        logger = logging.getLogger()
 
         # create console handler with a higher log level
         console_handler = logging.StreamHandler()
