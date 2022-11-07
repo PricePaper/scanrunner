@@ -7,4 +7,7 @@
     <orderEntry type="jdk" jdkName="Remote Python 3.10.5 Docker (registry.digitalocean.com/pricepaper/scanrunner:latest)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
+  <component name="TestRunnerService">
+    <option name="PROJECT_TEST_RUNNER" value="Unittests" />
+  </component>
 </module>

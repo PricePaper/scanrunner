@@ -460,6 +460,25 @@ class FileManager:
 #         return {'default': os.environ.get(key)}
 #     else:
 #         return {'required': True}
+class MailSender:
+
+    def __init__(self, configuration: dict) -> None:
+        """
+        Class to email Dcouments that can not be parsed
+
+        :param configuration: The configuration, loaded from the YAML file
+        :type configuration: dict
+        """
+
+        self.config: dict = configuration
+        self.smtp_server: str = self.config['smtp-server'] or '127.0.0.1'
+        self.smtp_port: int = self.config['smtp-port'] or 25
+        self.smtp_use_tls: bool = self.config['smtp-use-tls'] or False
+        self.smtp_user: str = self.config['smtp-user'] or 'root'
+        self.smtp_password: str = self.config['smtp-password'] or None
+
+    def _test_connection(self) -> bool:
+        pass
 
 def _parse_args():
     # Get configuration from environmental variables or command line
@@ -505,12 +524,13 @@ def get_configuration(config_file_name: str, server: str = "development", debug:
         # global config
         config: dict = yaml.safe_load(f)
 
-        # get login info from the config config_file
-        config['url'] = config['servers'][server]['url']
-        config['db'] = config['servers'][server]['database']
-        config['username'] = config['servers'][server]['username']
-        config['password'] = config['servers'][server]['password']
+        # add some convenience keys, so we don't have to read the server config everywhere
+        config['server']: str = server
 
+        for config_key, config_value in config['servers'][server].items():
+            config[config_key] = config_value
+
+        # Keep track of debug
         config['debug'] = debug
 
         # Set up statistics, if needed
@@ -529,8 +549,8 @@ def get_configuration(config_file_name: str, server: str = "development", debug:
                     yaml.safe_dump(statistics, f)
             config['statistics'] = statistics
 
-            logger = logging.getLogger()
-
+        # Get root logger
+        logger = logging.getLogger()
         # create console handler with a higher log level
         console_handler = logging.StreamHandler()
         if debug:

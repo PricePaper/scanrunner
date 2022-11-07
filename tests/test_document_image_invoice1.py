@@ -5,9 +5,6 @@ from unittest import TestCase
 import docscanner
 from docscanner import *
 
-docscanner.console_handler.setLevel(logging.DEBUG)
-docscanner.logger.addHandler(docscanner.console_handler)
-
 
 class TestGetConfiguration(TestCase):
 
@@ -130,6 +127,20 @@ class TestFileManager(TestCase):
 
         # reset file move
         document.file.replace(original_file)
+
+class TestMailer(TestCase):
+    def setUp(self) -> None:
+        self.test_invoice_file = "1-Customer_Invoice-INV-2022-11528.jpg"
+        self.config = docscanner.get_configuration("./test_config.yaml", "development", True)
+
+    def test_constructor(self):
+        mail = MailSender(self.config)
+        self.assertEqual(mail.smtp_server, "smtp.gmail.com")
+        self.assertEqual(mail.smtp_port, 25)
+        self.assertTrue(mail.smtp_use_tls)
+        self.assertEqual(mail.smtp_user, "system@pricepaper.com")
+
+        self.assertTrue(mail._test_connection())
 
 class TestInvoice(TestCase):
 
