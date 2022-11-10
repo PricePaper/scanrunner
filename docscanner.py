@@ -10,6 +10,8 @@ import sys
 import typing
 import xmlrpc.client
 from pathlib import Path
+from email.message import EmailMessage
+from smtplib import SMTP
 from time import sleep
 from typing import Any
 
@@ -61,6 +63,10 @@ class DocumentImage:
 
         # if we're passed a string, convert to Path
         self.file: Path = file if type(file) == Path else Path(file)
+
+        if not self.file.exists():
+            raise FileNotFoundError
+
         self._name: str = ""
         self._document_type = ""
         self.odoo_id: int = 0
@@ -139,9 +145,9 @@ class DocumentImage:
         for document, values in self.config['documents'].items():
 
             if self.file.match(values['file-name-match']):
-                mime_type = magic.from_file(self.filename, mime=True)
-                if mime_type in values['mime-types']:
-                    self.logger.debug(f"File: {self.filename} mime-type: {mime_type} document-type: {document}")
+                self.mime_type = magic.from_file(self.filename, mime=True)
+                if self.mime_type in values['mime-types']:
+                    self.logger.debug(f"File: {self.filename} mime-type: {self.mime_type} document-type: {document}")
                     self._document_type = document
 
         return self._document_type
@@ -464,21 +470,51 @@ class MailSender:
 
     def __init__(self, configuration: dict) -> None:
         """
-        Class to email Dcouments that can not be parsed
+        Class to email Documents that can not be parsed
 
         :param configuration: The configuration, loaded from the YAML file
         :type configuration: dict
         """
 
         self.config: dict = configuration
-        self.smtp_server: str = self.config['smtp-server'] or '127.0.0.1'
-        self.smtp_port: int = self.config['smtp-port'] or 25
-        self.smtp_use_tls: bool = self.config['smtp-use-tls'] or False
-        self.smtp_user: str = self.config['smtp-user'] or 'root'
-        self.smtp_password: str = self.config['smtp-password'] or None
+        self.logger = configuration['logger']
 
-    def _test_connection(self) -> bool:
-        pass
+
+
+    def mail_documents(self, documents: typing.List[DocumentImage]) -> None:
+
+        self.logger.info(f"Emailing failed documents {[docs.filename for docs in documents]} to {self.config['error-email']}")
+
+        # Create the message
+        msg = EmailMessage()
+        msg['Subject'] = f'Documents that failed to scan'
+        msg['To'] = self.config['error-email']
+        msg['From'] = f"Document Scanner <{self.config['smtp-user']}>"
+        msg.preamble = "A MIME aware email client is required to view this email properly.\n"
+
+        msg.set_content("""The documents attached could not be read. Please either attach them manually to their 
+        respective Odoo document, or resend them through the scanner.\n""")
+
+        # Add the files
+        mime_maintype: str
+        mime_subtype: str
+        for document in documents:
+            mime_type: str = document.mime_type if document.mime_type is not None or "" else "application/octet-stream"
+            mime_maintype, mime_subtype = mime_type.split('/', 1)
+            with document.file.open('rb') as fp:
+                msg.add_attachment(fp.read(),
+                                   maintype=mime_maintype,
+                                   subtype=mime_subtype,
+                                   filename=document.filename)
+
+        # Email the message
+        with SMTP(host=self.config['smtp-server'], port=self.config['smtp-port']) as smtp:
+            if self.config['smtp-use-tls']:
+                smtp.starttls()
+            smtp.ehlo_or_helo_if_needed()
+            smtp.login(self.config['smtp-user'], self.config['smtp-password'])
+            smtp.send_message(msg)
+
 
 def _parse_args():
     # Get configuration from environmental variables or command line
