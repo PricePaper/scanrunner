@@ -92,10 +92,22 @@ class DocumentImage:
 
     @property
     def filename(self) -> str:
+        """
+        Returns the name of the file
+        :return: file name
+        :rtype: str
+        """
         return str(self.file)
 
     @filename.setter
-    def filename(self, filename: str):
+    def filename(self, filename: str) -> None:
+        """
+        Sets the file name
+        :param filename:
+        :type filename: str
+        :return:
+        :rtype: None
+        """
         self.file = Path(filename)
 
     @property
@@ -109,7 +121,14 @@ class DocumentImage:
         return self._odoo_sequence
 
     @odoo_sequence.setter
-    def odoo_sequence(self, value):
+    def odoo_sequence(self, value: str) -> None:
+        """
+        This method is not implemented
+        :param value: Ignored
+        :type value: str
+        :return:
+        :rtype: NotImplementedError
+        """
 
         raise NotImplementedError("This field can not be set. Please modify the config.yaml instead.")
 
@@ -128,7 +147,7 @@ class DocumentImage:
             for i in regions:
                 try:
                     t: str = self._read_text(image, line_items_coordinates, -i).replace('\n', ' ')
-                    self.logger.debug(f'Reading {self.filename} region: {i} result: {document_str}')
+                    self.logger.debug(f'Reading {self.filename} region: {i} result: {t}')
                     m: re.Match = self.regex.search(t)
                     document_str = m.group(1)
                     if 'statistics' in self.config:
@@ -201,7 +220,14 @@ class DocumentImage:
         return self._name
 
     @name.setter
-    def name(self, value):
+    def name(self, value: str) -> None:
+        """
+        Not implement
+        :param value:
+        :type value: str
+        :return:
+        :rtype:
+        """
         raise NotImplementedError("This field can not be set. Try reset() to clear it.")
 
     def reset(self) -> None:
@@ -215,11 +241,23 @@ class DocumentImage:
         self._name = ""
 
     @property
-    def threshold_region_ignore(self):
+    def threshold_region_ignore(self) -> int:
+        """
+        For OpenCV
+        :return: current value of the DocumentImage
+        :rtype: int
+        """
         return self._threshold_region_ignore
 
     @threshold_region_ignore.setter
-    def threshold_region_ignore(self, threshold_region_ignore):
+    def threshold_region_ignore(self, threshold_region_ignore: int) -> None:
+        """
+        Sets the value for OpenCV processing of DocumentImage
+        :param threshold_region_ignore:
+        :type threshold_region_ignore: int
+        :return:
+        :rtype: None
+        """
         self._threshold_region_ignore = threshold_region_ignore
         self.reset()
 
@@ -318,13 +356,29 @@ class OdooConnector:
 
     @uid.setter
     def uid(self, user_id: int) -> None:
+        """
+        Set the Odoo uid for the connection
+        :param user_id: Odoo User ID
+        :type user_id: int
+        :return:
+        :rtype: None
+        """
         self._uid = user_id
 
     def odoo_document_id(self, document: DocumentImage) -> int:
+        """
+        Gets the documents Odoo ID by searching for the documents name in Odoo
+        :param document:
+        :type document: DocumentImage
+        :return: document's ID
+        :rtype: int
+        """
         retry: int = 0
         odoo_id: int = 0
 
         while odoo_id == 0 and retry < self.config['retry']:
+
+            # If we do not have a document name, we can't search Odoo so bail out
             if not document.name:
                 self.logger.warning(f"Unable to read document name from {document.filename}. SKIPPING")
                 return odoo_id
@@ -343,14 +397,23 @@ class OdooConnector:
                     else:
                         break
             except Exception as e:
-                self.logger.exception("There was a problem getting the document id from Odoo")
                 odoo_id = 0
                 retry += 1
+                self.logger.warning(e)
+                self.logger.exception(
+                    f"There was a problem getting the document id from Odoo. Retry {retry}/{self.config['retry']}")
                 sleep(self.config['retry_sleep'])
 
         return odoo_id
 
     def save_document(self, document: DocumentImage) -> int:
+        """
+        Saves the document to Odoo by creating an attachment
+        :param document:
+        :type document: DocumentImage
+        :return: The attachment ID
+        :rtype: int
+        """
         retry: int = 0
         while retry < self.config['retry']:
             try:
@@ -371,12 +434,14 @@ class OdooConnector:
                             return document.odoo_attachment_id
                 else:
                     self.logger.error(
-                        f'Save failed: document {document.name} from file: {document.filename} can not be found in Odoo.')
+                        f'Save failed: document {document.name} from file: {document.filename} can not be saved in Odoo.')
                     break
 
             except Exception as e:
-                self.logger.error(e)
                 retry += 1
+                self.logger.warning(e)
+                self.logger.exception(
+                    f"There was a problem saving the attachment in Odoo. Retry {retry}/{self.config['retry']}")
                 sleep(self.config['retry_sleep'])
 
         return 0
@@ -449,6 +514,13 @@ class FileManager:
                continue
 
     def done(self, document: DocumentImage) -> str:
+        """
+        Relocates file that has been processed to storage directory
+        :param document:
+        :type document: DocumentImage
+        :return: New file location
+        :rtype: str
+        """
 
         done_top_dir: Path = Path(f"{document.file.parent}/{self.config['done-path']}")
 
@@ -468,7 +540,7 @@ class FileManager:
         try:
             doc_type, doc_year, doc_number = document.name.split('/')
         except:
-            self.logger.warning(f"No document name for {document.filename}. Can not be safely moved.")
+            self.logger.warning(f"No appropriate document name for {document.filename}. Can not be safely moved.")
             return ""
 
         # Group documents by 100 to ease speed file access
@@ -514,6 +586,13 @@ class MailSender:
         self.logger = configuration['logger']
 
     def mail_document(self, document: DocumentImage) -> None:
+        """
+        Mails a DocumentImage to the email specified in the config file
+        :param document:
+        :type document: DocumentImage
+        :return:
+        :rtype: None
+        """
         retry: int = 0
         while retry < self.config['retry']:
             try:
