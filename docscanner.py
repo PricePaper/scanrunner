@@ -5,11 +5,14 @@ import base64
 import logging
 import os
 import re
+import smtplib
 import ssl
 import sys
 import typing
 import xmlrpc.client
+from email.message import EmailMessage
 from pathlib import Path
+from smtplib import SMTP
 from time import sleep
 from typing import Any
 
@@ -55,26 +58,40 @@ class DocumentImage:
     def __init__(self, config: dict, file: object):
         """
         Class for all document images being processed by OCR
+        :param config configuration from YAML file
+        :type config: dict
         :param file: The file to be processed
-        :type file: Path or string that will be converted to a Path object
+        :type file: object
         """
 
         # if we're passed a string, convert to Path
         self.file: Path = file if type(file) == Path else Path(file)
+
+        if not self.file.exists():
+            raise FileNotFoundError
+
+        self.mime_type: str = ""
         self._name: str = ""
         self._document_type = ""
         self.odoo_id: int = 0
         self.odoo_attachment_id: int = 0
+        self.is_emailed: bool = False
+        self._odoo_sequence: str = ""
+        self._threshold_region_ignore: int = 0
+        self.regex: re.Pattern = re.compile("")
+        self._regions_list: list[list[int]] = []
+
         self.config = config
         self.logger = config['logger']
 
-        self._odoo_sequence: str = config['documents'][self.document_type]['odoo_sequence']
-        self._threshold_region_ignore: int = config['documents'][self.document_type]['threshold_region_ignore']
-        self.regex: re.Pattern = re.compile(config['documents'][self.document_type]['ocr_regex'])
-        self._regions_list: list[list[int]] = config['documents'][self.document_type]['regions']
+        if self.document_type:
+            self._odoo_sequence = config['documents'][self.document_type]['odoo_sequence']
+            self._threshold_region_ignore = config['documents'][self.document_type]['threshold_region_ignore']
+            self.regex = re.compile(config['documents'][self.document_type]['ocr_regex'])
+            self._regions_list = config['documents'][self.document_type]['regions']
 
     @property
-    def filename(self):
+    def filename(self) -> str:
         return str(self.file)
 
     @filename.setter
@@ -111,15 +128,17 @@ class DocumentImage:
             for i in regions:
                 try:
                     t: str = self._read_text(image, line_items_coordinates, -i).replace('\n', ' ')
-                    self.logger.debug(f'Region: {i} document string: {document_str}')
+                    self.logger.debug(f'Reading {self.filename} region: {i} result: {document_str}')
                     m: re.Match = self.regex.search(t)
                     document_str = m.group(1)
-                    if document_str:
+                    if 'statistics' in self.config:
                         count: int = self.config['statistics'][self.document_type].setdefault(i, 0) + 1
                         self.config['statistics'][self.document_type][i] = count
-                        return document_str
+                        self.logger.debug(f'Region: {i} found {document_str} in document string: {t}')
 
-                except Exception as e:
+                    return document_str
+
+                except Exception:
                     continue
 
         return document_str
@@ -136,14 +155,14 @@ class DocumentImage:
         if self._document_type:
             return self._document_type
 
+        self.mime_type = magic.from_file(self.filename, mime=True)
+
         for document, values in self.config['documents'].items():
 
             if self.file.match(values['file-name-match']):
-                mime_type = magic.from_file(self.filename, mime=True)
-                if mime_type in values['mime-types']:
-                    self.logger.debug(f"File: {self.filename} mime-type: {mime_type} document-type: {document}")
+                if self.mime_type in values['mime-types']:
+                    self.logger.debug(f"File: {self.filename} mime-type: {self.mime_type} document-type: {document}")
                     self._document_type = document
-
         return self._document_type
 
     @document_type.setter
@@ -266,7 +285,7 @@ class OdooConnector:
         """
         self.config: dict = configuration
         self.url: str = self.config['url']
-        self.db: str = self.config['db']
+        self.db: str = self.config['database']
         self.username: str = self.config['username']
         self.password: str = self.config['password']
         self.logger: logging.Logger = configuration['logger']
@@ -433,10 +452,24 @@ class FileManager:
 
         done_top_dir: Path = Path(f"{document.file.parent}/{self.config['done-path']}")
 
+        # If this document wasn't read, but has been emailed, short circuit
+        if not document.name and document.is_emailed:
+            done_path: Path = done_top_dir.joinpath("unreadable")
+            done_path.mkdir(exist_ok=True, parents=True)
+            document.file = document.file.replace(done_path.joinpath(str(document.file)))
+            self.logger.warning(f"Moved unreadable file -> {document.filename}")
+            return document.filename
+
         doc_type: str
         doc_year: str
         doc_number: str
-        doc_type, doc_year, doc_number = document.name.split('/')
+
+        # If we can't split/unpack name, we should leave the method
+        try:
+            doc_type, doc_year, doc_number = document.name.split('/')
+        except:
+            self.logger.warning(f"No document name for {document.filename}. Can not be safely moved.")
+            return ""
 
         # Group documents by 100 to ease speed file access
         doc_grouping: int = int(doc_number) // 100
@@ -467,6 +500,61 @@ class FileManager:
 #         return {'default': os.environ.get(key)}
 #     else:
 #         return {'required': True}
+class MailSender:
+
+    def __init__(self, configuration: dict) -> None:
+        """
+        Class to email Documents that can not be parsed
+
+        :param configuration: The configuration, loaded from the YAML file
+        :type configuration: dict
+        """
+
+        self.config: dict = configuration
+        self.logger = configuration['logger']
+
+    def mail_document(self, document: DocumentImage) -> None:
+        retry: int = 0
+        while retry < self.config['retry']:
+            try:
+
+                # Create the message
+                msg = EmailMessage()
+                msg['Subject'] = f'Document failed to scan: {document.filename}'
+                msg['To'] = self.config['error-email']
+                msg['From'] = f"Document Scanner <{self.config['smtp-user']}>"
+                msg.preamble = "A MIME aware email client is required to view this email properly.\n"
+
+                msg.set_content(self.config['error-mail-message'])
+
+                # Add the files
+                mime_maintype: str
+                mime_subtype: str
+                mime_type: str = document.mime_type if document.mime_type is not None or "" else "application/octet-stream"
+                mime_maintype, mime_subtype = mime_type.split('/', 1)
+                with document.file.open('rb') as fp:
+                    msg.add_attachment(fp.read(), maintype=mime_maintype, subtype=mime_subtype,
+                                       filename=document.filename)
+
+                # Email the message
+                with SMTP(host=self.config['smtp-server'], port=self.config['smtp-port']) as smtp:
+                    if self.config['smtp-use-tls']:
+                        smtp.starttls()
+                    smtp.ehlo_or_helo_if_needed()
+                    smtp.login(self.config['smtp-user'], self.config['smtp-password'])
+                    smtp.send_message(msg)
+
+                    self.logger.info(f"Emailed failed document {document.filename} to {self.config['error-email']}")
+                    document.is_emailed = True
+
+                    # If we've gotten this far, the mail sent, and we can short circuit the retry loop
+                    return
+
+            except smtplib.SMTPException as e:
+                self.logger.error(e)
+                retry += 1
+                sleep(self.config['retry_sleep'])
+
 
 def _parse_args():
     # Get configuration from environmental variables or command line
@@ -512,12 +600,13 @@ def get_configuration(config_file_name: str, server: str = "development", debug:
         # global config
         config: dict = yaml.safe_load(f)
 
-        # get login info from the config config_file
-        config['url'] = config['servers'][server]['url']
-        config['db'] = config['servers'][server]['database']
-        config['username'] = config['servers'][server]['username']
-        config['password'] = config['servers'][server]['password']
+        # add some convenience keys, so we don't have to read the server config everywhere
+        config['server']: str = server
 
+        for config_key, config_value in config['servers'][server].items():
+            config[config_key] = config_value
+
+        # Keep track of debug
         config['debug'] = debug
 
         # Set up statistics, if needed
@@ -532,23 +621,25 @@ def get_configuration(config_file_name: str, server: str = "development", debug:
                         statistics[doc_type] = {}
             else:
                 statistics = {doc_type: {} for doc_type in config['documents']}
-                with open(str(stats_file), 'w') as f:
+                with stats_file.open('w') as f:
                     yaml.safe_dump(statistics, f)
             config['statistics'] = statistics
 
         # Get root logger
         logger = logging.getLogger()
-
         # create console handler with a higher log level
         console_handler = logging.StreamHandler()
         if debug:
+            logger.setLevel(logging.DEBUG)
             console_handler.setLevel(logging.DEBUG)
         else:
+            logger.setLevel(logging.INFO)
             console_handler.setLevel(logging.INFO)
         # create formatter and add it to the handlers
         formatter = logging.Formatter('%(asctime)s - %(processName)s - %(levelname)s - %(message)s')
         console_handler.setFormatter(formatter)
         # add the handlers to logger
+
         logger.addHandler(console_handler)
         config['logger'] = logger
 
@@ -574,17 +665,20 @@ def main():
     # get our manager objects
     file_manager: FileManager = FileManager(config)
     odoo: OdooConnector = OdooConnector(config)
+    mailer: MailSender = MailSender(config)
 
     # Get the documents
     documents: typing.Generator[DocumentImage, None, None] = file_manager.document_generator(args.file)
 
     for document in documents:
-        if odoo.save_document(document):
-            logger.info(f"Saved {document.name} ID: {document.odoo_id} to odoo server: {args.server}")
-            file_manager.done(document)
-        else:
-            logger.error(f"Unable to process file: {document.filename}. SKIPPING.")
+        if document.document_type:
+            if odoo.save_document(document):
+                logger.info(f"Saved {document.name} ID: {document.odoo_id} to odoo server: {args.server}")
+            else:
+                logger.error(f"Unable to process file: {document.filename}. Mailing to {config['error-email']}")
+                mailer.mail_document(document)
 
+            file_manager.done(document)
     # Save statistics before we exit
     if args.stats:
         with open(config['statistics-file'], 'w') as f:
