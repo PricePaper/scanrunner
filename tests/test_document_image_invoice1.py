@@ -16,7 +16,7 @@ class TestGetConfiguration(TestCase):
     def test_function_get_configuration(self) -> None:
         config = get_configuration(self.config_file_name, self.server)
 
-        self.assertEqual("ppt-apps15-20221028", config['db'])
+        self.assertEqual("ppt-apps15-20221028", config['database'])
         self.assertEqual("/usr/bin/tesseract", config['tesseract-bin'])
         self.assertEqual("account.move", config['documents']['Invoice']['odoo_object'])
 
@@ -54,8 +54,9 @@ class TestFileManager(TestCase):
 
     def setUp(self) -> None:
         self.test_invoice_file = "1-Customer_Invoice-INV-2022-11528.jpg"
+        self.test_bad_invoice_file = "bad_Customer_Invoice1.jpg"
         self.test_invoice_name = "INV/2022/11528"
-        self.config = docscanner.get_configuration("./test_config.yaml", "development", True)
+        self.config = docscanner.get_configuration("./test_config.yaml", "development", True, True)
 
     def test_construction(self):
         self.assertIsInstance(FileManager(self.config), FileManager)
@@ -128,6 +129,31 @@ class TestFileManager(TestCase):
         # reset file move
         document.file.replace(original_file)
 
+    def test_bad_file_done(self):
+        """
+        Testing moving a Document to its done location
+        :return: None
+        :rtype: None
+        """
+        mgr = FileManager(self.config)
+
+        document = DocumentImage(self.config, self.test_bad_invoice_file)
+        original_file = document.file
+
+        print(f"{self.shortDescription()} original file:{document.filename}")
+
+        # File manager wont move Documents that have not been emailed
+        document.is_emailed = True
+
+        mgr.done(document)
+
+        self.assertTrue(document.file.exists())
+        print(f"{self.shortDescription()} done file:{document.filename}")
+
+        # reset file move
+        document.file.replace(original_file)
+
+
 class TestMailer(TestCase):
     def setUp(self) -> None:
         self.bad_test_invoice_file1 = "bad_Customer_Invoice1.jpg"
@@ -140,18 +166,17 @@ class TestMailer(TestCase):
     def test_constructor(self):
         mail = MailSender(self.config)
 
-        #Make sure we can read the config
+        # Make sure we can read the config
         self.assertEqual(mail.config['smtp-server'], "smtp.gmail.com")
         self.assertEqual(mail.config['error-email'], "ean@pricepaper.com")
 
     def test_send_documents(self):
-
-        # package up the bad docs as a list
-        bad_docs: list = [self.bad_doc1, self.bad_doc2]
-
         mail = MailSender(self.config)
 
-        mail.mail_documents(bad_docs)
+        mail.mail_document(self.bad_doc1)
+        self.assertTrue(self.bad_doc1.is_emailed)
+        mail.mail_document(self.bad_doc2)
+        self.assertTrue(self.bad_doc2.is_emailed)
 
 
 class TestInvoice(TestCase):
