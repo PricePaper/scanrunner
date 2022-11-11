@@ -117,12 +117,13 @@ class DocumentImage:
             for i in regions:
                 try:
                     t: str = self._read_text(image, line_items_coordinates, -i).replace('\n', ' ')
-                    self.logger.debug(f'Region: {i} document string: {document_str}')
+                    self.logger.debug(f'Region: {i} document string: {t}')
                     m: re.Match = self.regex.search(t)
                     document_str = m.group(1)
                     if document_str:
                         count: int = self.config['statistics'][self.document_type].setdefault(i, 0) + 1
                         self.config['statistics'][self.document_type][i] = count
+                        self.logger.debug(f'Region: {i} found {document_str} in document string: {t}')
                         return document_str
 
                 except Exception as e:
