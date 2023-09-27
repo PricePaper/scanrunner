@@ -1,4 +1,4 @@
-FROM alpine:3.16
+FROM alpine:3.16 AS base
 
 LABEL maintainer="Ean J Price <ean@pricepaper.com>"
 
@@ -19,6 +19,8 @@ RUN apk upgrade && \
       py3-packaging \
       py3-parsing &&\
       pip3 --no-cache -q install pytesseract
+
+FROM base
 
 COPY entrypoint.sh docscanner.py  /
 
