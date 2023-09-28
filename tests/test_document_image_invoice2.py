@@ -8,7 +8,11 @@ from docscanner import *
 class TestInvoice2(TestCase):
 
     def setUp(self) -> None:
-        self.test_invoice_file = "INV-2022-10515-2.jpg"
+        self.config_file: Path = Path("./test_config.yaml")
+        self.config_file_name = str(self.config_file)
+        self.server = "development"
+
+        self.test_invoice_file = "documents/INV-2022-10515-2.jpg"
         self.test_invoice_name = "INV/2022/10515"
 
     def test_construction_with_invoice(self) -> None:

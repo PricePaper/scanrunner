@@ -16,7 +16,7 @@ class TestGetConfiguration(TestCase):
     def test_function_get_configuration(self) -> None:
         config = get_configuration(self.config_file_name, self.server)
 
-        self.assertEqual("ppt-apps15-20221028", config['database'])
+        self.assertEqual("ppt-apps15-20230927", config['database'])
         self.assertEqual("/usr/bin/tesseract", config['tesseract-bin'])
         self.assertEqual("account.move", config['documents']['Invoice']['odoo_object'])
 
@@ -24,7 +24,7 @@ class TestGetConfiguration(TestCase):
 class TestOdooConnector(TestCase):
     def setUp(self) -> None:
         self.config = docscanner.get_configuration("./test_config.yaml", "development")
-        self.test_invoice_file = "1-Customer_Invoice-INV-2022-11528.jpg"
+        self.test_invoice_file = "documents/1-Customer_Invoice-INV-2022-11528.jpg"
         self.test_invoice_name = "INV/2022/11528"
 
     def test_constructor(self):
@@ -53,8 +53,8 @@ class TestOdooConnector(TestCase):
 class TestFileManager(TestCase):
 
     def setUp(self) -> None:
-        self.test_invoice_file = "1-Customer_Invoice-INV-2022-11528.jpg"
-        self.test_bad_invoice_file = "bad_Customer_Invoice1.jpg"
+        self.test_invoice_file = "documents/1-Customer_Invoice-INV-2022-11528.jpg"
+        self.test_bad_invoice_file = "documents/bad_Customer_Invoice1.jpg"
         self.test_invoice_name = "INV/2022/11528"
         self.config = docscanner.get_configuration("./test_config.yaml", "development", True, True)
 
@@ -66,9 +66,9 @@ class TestFileManager(TestCase):
         fmgr: FileManager = FileManager(self.config)
 
         arg1: str = "."
-        arg2: str = "./1-Customer_Invoice-INV-2022-11528.jpg"
-        arg3: str = "*.jpg"
-        arg4: str = "*.foo"
+        arg2: str = "documents/1-Customer_Invoice-INV-2022-11528.jpg"
+        arg3: str = "documents/*.jpg"
+        arg4: str = "documents/*.foo"
 
         self.assertEqual([f for f in Path(arg1).iterdir() if f.is_file()], fmgr._get_paths_from_string(arg1))
         self.assertEqual([Path(arg2), ], fmgr._get_paths_from_string(arg2))
@@ -80,8 +80,8 @@ class TestFileManager(TestCase):
     def test_document_generator_files(self):
         mgr = FileManager(self.config)
 
-        files: [str] = ["./1-Customer_Invoice-INV-2022-11528.jpg",
-                        "2-Customer_Invoice-INV-2022-10515-2.jpg"]
+        files: [str] = ["documents/1-Customer_Invoice-INV-2022-11528.jpg",
+                        "documents/2-Customer_Invoice-INV-2022-10515-2.jpg"]
 
         names: [str] = ["INV/2022/11528",
                         "INV/2022/10515"]
@@ -156,8 +156,8 @@ class TestFileManager(TestCase):
 
 class TestMailer(TestCase):
     def setUp(self) -> None:
-        self.bad_test_invoice_file1 = "bad_Customer_Invoice1.jpg"
-        self.bad_test_invoice_file2 = "bad_Customer_Invoice2.jpg"
+        self.bad_test_invoice_file1 = "documents/bad_Customer_Invoice1.jpg"
+        self.bad_test_invoice_file2 = "documents/bad_Customer_Invoice2.jpg"
         self.config = docscanner.get_configuration("./test_config.yaml", "development", True)
 
         self.bad_doc1 = DocumentImage(self.config, self.bad_test_invoice_file1)
@@ -183,7 +183,7 @@ class TestInvoice(TestCase):
 
     def setUp(self) -> None:
         self.config = docscanner.get_configuration("./test_config.yaml", "development")
-        self.test_invoice_file = "1-Customer_Invoice-INV-2022-11528.jpg"
+        self.test_invoice_file = "documents/1-Customer_Invoice-INV-2022-11528.jpg"
         self.test_invoice_name = "INV/2022/11528"
         self.odoo_id = 100
 
@@ -280,3 +280,59 @@ class TestInvoice(TestCase):
     def test_odoo_id(self):
         invoice = DocumentImage(self.config, self.test_invoice_file)
         self.assertEqual(invoice.odoo_id, 0)
+
+
+class TestReceipt(TestCase):
+
+    def setUp(self) -> None:
+        self.config = docscanner.get_configuration("./test_config.yaml", "development")
+
+        self.test_receipt_file = "documents/3-Receipt-WH-IN-2023-01979.pdf"
+        self.test_receipt_name = "WH/IN/2023/01979"
+
+        self.test_receipt_file2 = "documents/4-Receipt-WH-IN-2023-01966.pdf"
+        self.test_receipt_name2 = "WH/IN/2023/01966.pdf"
+
+    def test_get_document_type(self):
+        document = DocumentImage(self.config, self.test_receipt_file)
+
+        doc_type: str = document.document_type
+
+        self.assertEqual(doc_type, "Receipt")
+
+    def test__mark_region(self):
+        pass
+
+    def test__read_text(self) -> None:
+        """
+        Testing the private method DocumentImage._read_text
+        :return: None
+        :rtype: None
+        """
+        print(self.shortDescription())
+        receipt: DocumentImage = DocumentImage(self.config, self.test_receipt_file)
+        image, line_items_coordinates = receipt._mark_region()
+
+        # Read the 6th region from the top and compare to what it should be
+        self.assertEqual(receipt._read_text(image, line_items_coordinates, -7),
+                         f"Draft receipt {self.test_receipt_name}\n")
+
+    def test__read(self):
+        """
+        Testing the private method DocumentImage._read
+        :return: None
+        :rtype: None
+        """
+        print(self.shortDescription())
+        receipt = DocumentImage(self.config, self.test_receipt_file)
+        self.assertEqual(self.test_receipt_name.lstrip('INV'), receipt._read())
+
+    def test_name(self):
+        """
+       Testing the public accessor DocumentImage.name
+       :return: None
+       :rtype: None
+       """
+        print(self.shortDescription())
+        receipt = DocumentImage(self.config, self.test_receipt_file)
+        self.assertEqual(self.test_receipt_name, receipt.name)
