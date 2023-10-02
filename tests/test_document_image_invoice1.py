@@ -314,8 +314,8 @@ class TestReceipt(TestCase):
         image, line_items_coordinates = receipt._mark_region()
 
         # Read the 6th region from the top and compare to what it should be
-        self.assertEqual(receipt._read_text(image, line_items_coordinates, -7),
-                         f"Draft receipt {self.test_receipt_name}\n")
+        self.assertEqual(receipt._read_text(image, line_items_coordinates, -2),
+                         {self.test_receipt_name})
 
     def test__read(self):
         """

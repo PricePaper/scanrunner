@@ -9,6 +9,7 @@ import smtplib
 import ssl
 import sys
 import typing
+import tempfile
 import xmlrpc.client
 from email.message import EmailMessage
 from pathlib import Path
@@ -52,6 +53,11 @@ except ImportError:
     print("The Pillow module is not installed.", sys.stderr)
     sys.exit(1)
 
+try:
+    import pdf2image
+except ImportError:
+    print("The pdf2image module is not installed", sys.stderr)
+    sys.exit(1)
 
 class DocumentImage:
 
@@ -261,6 +267,30 @@ class DocumentImage:
         self._threshold_region_ignore = threshold_region_ignore
         self.reset()
 
+    def _get_image_file_name(self) -> str:
+
+        res: str = ""
+
+        match self.mime_type:
+            case "image/jpeg" | "image/png":
+                res = self.filename
+            case "application/pdf":
+
+                # Assign tempfile to the object to prevent it being GC'd until we're done with it
+                self._temp_image_file: tempfile.NamedTemporaryFile = tempfile.NamedTemporaryFile(suffix=".jpg")
+
+                n_threads: int = 1
+                if sys.platform == "linux":
+                    n_threads = len(os.sched_getaffinity(0)) // 2 or 1
+
+                # pdf2image converts the whole PDF, but we only need the first page
+                pages: list[Image] = pdf2image.convert_from_path(self.filename, last_page=1, thread_count= n_threads)
+                pages[0].save(self._temp_image_file, format="jpeg")
+                self._temp_image_file.flush()
+                self._temp_image_file.seek(0)
+                res = self._temp_image_file.name
+
+        return res
     def _mark_region(self):
         """
         This method finds and defines regions in the image file using opencv2. Once the regions are identified, we can
@@ -270,7 +300,11 @@ class DocumentImage:
         :rtype: None
         """
 
-        image = cv2.imread(self.filename)
+        # We need to handle PDFs differently from images. PDFs most likely have more than one page. We'll "ass"ume that
+        # the first page is the correct one to mark
+
+        image_file_name = self._get_image_file_name()
+        image = cv2.imread(image_file_name)
 
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
@@ -295,6 +329,9 @@ class DocumentImage:
 
             image = cv2.rectangle(image, (x, y), (x + w, y + h), color=(255, 0, 255), thickness=3)
             line_items_coordinates.append([(x, y), (x + w, y + h)])
+
+#       if hasattr(self, '_temp_image_file'):
+#           self._temp_image_file.close()
 
         return image, line_items_coordinates
 
