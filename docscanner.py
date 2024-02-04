@@ -8,8 +8,8 @@ import re
 import smtplib
 import ssl
 import sys
-import typing
 import tempfile
+import typing
 import xmlrpc.client
 from email.message import EmailMessage
 from pathlib import Path
@@ -319,12 +319,14 @@ class DocumentImage:
         cnts = cv2.findContours(dilate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cnts = cnts[0] if len(cnts) == 2 else cnts[1]
 
+        # Store ignore region locally for readability
+        i: int = self.threshold_region_ignore
         line_items_coordinates: list[list[tuple[Any, Any]]] = []
         for c in cnts:
             area = cv2.contourArea(c)
             x, y, w, h = cv2.boundingRect(c)
 
-            if w < self.threshold_region_ignore or h < self.threshold_region_ignore:
+            if w < i or h < i:
                 continue
 
             image = cv2.rectangle(image, (x, y), (x + w, y + h), color=(255, 0, 255), thickness=3)
@@ -347,6 +349,7 @@ class DocumentImage:
 
         # pytesseract image to string to get results
         text = str(pytesseract.image_to_string(thresh1, config='--psm 6'))
+        self.logger.debug(f'threashold-ignore: {self.threshold_region_ignore} index: {index} text: {text}')
         return text
 
 
@@ -464,6 +467,8 @@ class OdooConnector:
                                 'name': document.name.replace('/', '-') + '_' + document.filename.replace('/', '-'),
                                 'res_id': document.odoo_id,
                                 'res_model': self.config['documents'][document.document_type]['odoo_object'],
+                                'attachment_tag_id': self.config['documents'][document.document_type][
+                                    'odoo_attachment_tag_id'],
                                 'datas': data.decode('ascii')}
                             document.odoo_attachment_id = models.execute_kw(self.db, self.uid, self.password,
                                                                             'ir.attachment', 'create', [values, ])
