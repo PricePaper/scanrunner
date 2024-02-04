@@ -427,6 +427,7 @@ class OdooConnector:
                                 'name': document.name.replace('/', '-') + '_' + document.filename.replace('/', '-'),
                                 'res_id': document.odoo_id,
                                 'res_model': self.config['documents'][document.document_type]['odoo_object'],
+                                'attachment_tag_id': self.config['documents'][document.document_type]['odoo_attachment_tag_id'],
                                 'datas': data.decode('ascii')}
                             document.odoo_attachment_id = models.execute_kw(self.db, self.uid, self.password,
                                                                             'ir.attachment', 'create', [values, ])
