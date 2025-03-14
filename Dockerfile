@@ -1,4 +1,4 @@
-FROM alpine:3.16 AS base
+FROM alpine:3.20 AS base
 
 LABEL maintainer="Ean J Price <ean@pricepaper.com>"
 
@@ -18,7 +18,7 @@ RUN apk upgrade && \
       py3-pillow \
       py3-packaging \
       py3-parsing &&\
-      pip3 --no-cache -q install pytesseract
+      pip3 --no-cache -q install --break-system-packages pytesseract
 
 FROM base
 

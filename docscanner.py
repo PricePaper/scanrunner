@@ -75,6 +75,7 @@ class DocumentImage:
         self._document_type = ""
         self.odoo_id: int = 0
         self.odoo_attachment_id: int = 0
+        self.odoo_document_id: int = 0
         self.is_emailed: bool = False
         self._odoo_sequence: str = ""
         self._threshold_region_ignore: int = 0
@@ -421,6 +422,7 @@ class OdooConnector:
                 if document.odoo_id or self.odoo_document_id(document):
                     with xmlrpc.client.ServerProxy(f'{self.url}/xmlrpc/2/object', allow_none=True,
                                                    context=ssl._create_unverified_context()) as models:
+                        # Open file and send to Odoo to create ir.attachment
                         with document.file.open('rb') as f:
                             data = base64.b64encode(f.read())
                             values = {
@@ -431,8 +433,15 @@ class OdooConnector:
                                 'datas': data.decode('ascii')}
                             document.odoo_attachment_id = models.execute_kw(self.db, self.uid, self.password,
                                                                             'ir.attachment', 'create', [values, ])
+                            # From ir.attachment, we create an Odoo document
+                            doc_values = {
+                                'attachment_id': document.odoo_attachment_id,
+                                'folder_id': self.config['documents'][document.document_type]['odoo_folder_id'],
+                                'active': True,
+                            }
+                            document.odoo_document_id = models.execute_kw(self.db, self.uid, self.password, 'documents.document', 'create', [doc_values, ])
 
-                            return document.odoo_attachment_id
+                            return document.odoo_document_id
                 else:
                     self.logger.error(
                         f'Save failed: document {document.name} from file: {document.filename} can not be saved in Odoo.')
@@ -753,7 +762,7 @@ def main():
     for document in documents:
         if document.document_type:
             if odoo.save_document(document):
-                logger.info(f"Saved {document.name} ID: {document.odoo_id} to odoo server: {args.server}")
+                logger.info(f"Saved {document.name} ID: {document.odoo_id} document:{document.odoo_document_id} to odoo server: {args.server}")
             else:
                 logger.error(f"Unable to process file: {document.filename}. Mailing to {config['error-email']}")
                 mailer.mail_document(document)
