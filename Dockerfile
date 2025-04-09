@@ -1,4 +1,4 @@
-FROM alpine:3.18 AS base
+FROM alpine:3.20 AS base
 
 LABEL maintainer="Ean J Price <ean@pricepaper.com>"
 
@@ -9,7 +9,6 @@ RUN apk upgrade && \
    apk add --no-cache \
       tini \
       tesseract-ocr \
-      poppler-utils \
       py3-pip \
       py3-magic \
       py3-yaml \
@@ -18,8 +17,8 @@ RUN apk upgrade && \
       py3-psutil \
       py3-pillow \
       py3-packaging \
-      py3-parsing \
-      && pip3 --no-cache -q install pytesseract pdf2image
+      py3-parsing &&\
+      pip3 --no-cache -q install --break-system-packages pytesseract
 
 FROM base
 

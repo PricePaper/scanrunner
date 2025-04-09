@@ -3,7 +3,7 @@
   <component name="Black">
     <option name="sdkName" value="Remote Python 3.10.5 Docker (registry.digitalocean.com/pricepaper/scanrunner:latest)" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="Remote Python 3.10.5 Docker (registry.digitalocean.com/pricepaper/scanrunner:latest)" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="Remote Python 3.10.13 Docker (registry.digitalocean.com/pricepaper/scanrunner:0.99.5)" project-jdk-type="Python SDK" />
   <component name="PythonCompatibilityInspectionAdvertiser">
     <option name="version" value="3" />
   </component>
