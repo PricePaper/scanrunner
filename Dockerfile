@@ -17,6 +17,7 @@ RUN apk upgrade && \
       py3-psutil \
       py3-pillow \
       py3-packaging \
+      py3-pdf2image \
       py3-parsing &&\
       pip3 --no-cache -q install --break-system-packages pytesseract
 

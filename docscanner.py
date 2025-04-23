@@ -84,7 +84,7 @@ class DocumentImage:
         self.odoo_document_id: int = 0
         self.is_emailed: bool = False
         self._odoo_sequence: str = ""
-        self._threshold_region_ignore: int = 0
+        self._threshold_region_ignore: int = 80
         self.regex: re.Pattern = re.compile("")
         self._regions_list: list[list[int]] = []
 
@@ -93,7 +93,8 @@ class DocumentImage:
 
         if self.document_type:
             self._odoo_sequence = config['documents'][self.document_type]['odoo_sequence']
-            self._threshold_region_ignore = config['documents'][self.document_type]['threshold_region_ignore']
+            #self.threshold_region_ignore = config['documents'][self.document_type]['threshold_region_ignore']
+            self.threshold_region_ignore = 80
             self.regex = re.compile(config['documents'][self.document_type]['ocr_regex'])
             self._regions_list = config['documents'][self.document_type]['regions']
 
@@ -189,6 +190,7 @@ class DocumentImage:
                 if self.mime_type in values['mime-types']:
                     self.logger.debug(f"File: {self.filename} mime-type: {self.mime_type} document-type: {document}")
                     self._document_type = document
+                    break
         return self._document_type
 
     @document_type.setter
@@ -219,7 +221,7 @@ class DocumentImage:
             if name:
                 self._name = self.odoo_sequence + name
             else:
-                self.threshold_region_ignore -= self.config['documents'][self.document_type][
+                self.threshold_region_ignore = self.threshold_region_ignore - self.config['documents'][self.document_type][
                     'threshold_region_ignore_decrement']
                 self.logger.debug(
                     f"{self.filename} can not be parsed. Changing OCR sensitivity {self.threshold_region_ignore + self.config['documents'][self.document_type]['threshold_region_ignore_decrement']} -> {self.threshold_region_ignore}.")

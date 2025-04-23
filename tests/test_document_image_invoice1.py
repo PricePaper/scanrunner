@@ -16,7 +16,7 @@ class TestGetConfiguration(TestCase):
     def test_function_get_configuration(self) -> None:
         config = get_configuration(self.config_file_name, self.server)
 
-        self.assertEqual("ppt-apps15-20230927", config['database'])
+        self.assertEqual("test-20250412", config['database'])
         self.assertEqual("/usr/bin/tesseract", config['tesseract-bin'])
         self.assertEqual("account.move", config['documents']['Invoice']['odoo_object'])
 
