@@ -3,12 +3,11 @@
 # use this command to install open cv2
 # pip install opencv-python
 
-import sys
 import re
+import sys
+
 import cv2
 import pytesseract
-
-from PIL import Image
 
 invoice_rexp = re.compile(r'(R?INV\/20[0-9]{2}\/[0-9]{4,7}).+Date:.+([01][0-0]\/[0-3][0-9]\/20[0-9]{2}).+Partner Code:.+([A-Z0-9]{6})')
 
@@ -64,7 +63,7 @@ def read_text(image, line_items_coordinates):
 
         # pytesseract image to string to get results
         text = str(pytesseract.image_to_string(thresh1, config='--psm 6')).replace('\n', ' ')
-        print(index, text)
+        # print(index, text)
 
     return text
 

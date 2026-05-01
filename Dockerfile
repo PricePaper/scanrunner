@@ -1,29 +1,36 @@
-FROM alpine:3.21 AS base
+FROM debian:trixie-slim AS base
 
 LABEL maintainer="Ean J Price <ean@pricepaper.com>"
 
-RUN apk upgrade && \
-   /usr/sbin/addgroup -g 1001 scanner &&\
-   /usr/sbin/adduser -G scanner -s /bin/sh -D -u 1001 scanner &&\
-   mkdir /scanner &&\
-   apk add --no-cache \
-      tini \
-      tesseract-ocr \
-      py3-pip \
-      py3-magic \
-      py3-yaml \
-      py3-numpy \
-      py3-opencv \
-      py3-psutil \
-      py3-pillow \
-      py3-packaging \
-      py3-parsing &&\
-      pip3 --no-cache -q install --break-system-packages --root-user-action ignore pytesseract
+# Set DEBIAN_FRONTEND to noninteractive to avoid prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    groupadd --gid 1001 scanner && \
+    useradd --uid 1001 --gid 1001 --shell /bin/bash -d /scanner -m scanner && \
+    apt-get install -y --no-install-recommends \
+       tini \
+       tesseract-ocr \
+       python3-magic \
+       python3-yaml \
+       python3-numpy \
+       python3-opencv \
+       python3-psutil \
+       python3-pil \
+       python3-packaging \
+       python3-pyparsing \
+       python3-pip && \
+      apt-get clean && \
+      rm -rf /var/lib/apt/lists/*
+
+RUN pip3 --no-cache -q install --break-system-packages --root-user-action ignore pytesseract
 
 FROM base
 
 COPY entrypoint.sh docscanner.py  /
 
-ENTRYPOINT ["/sbin/tini", "--"]
+# Note: The path for tini on Debian is /usr/bin/tini
+ENTRYPOINT ["/usr/bin/tini", "--"]
 
 CMD ["/entrypoint.sh"]
