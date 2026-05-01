@@ -87,8 +87,14 @@ class DocumentImage:
         self.ocr_top_half_only: bool = False
         self.tesseract_config: str = "--psm 6 -l eng"
         self.search_regions: list[list[int]] = []
-        # Output controls
-        self.storage_png_compress_level: int = 6  # used for Odoo/Email B&W PNG
+        # Storage/output controls (defaults; can be overridden per-document)
+        self.storage_format: str = "jpeg"  # jpeg|png|webp
+        self.storage_keep_color: bool = True
+        self.storage_jpeg_quality: int = 85
+        self.storage_jpeg_subsampling: str = "4:2:0"  # 4:4:4, 4:2:2, 4:2:0
+        self.storage_progressive: bool = True
+        self.storage_optimize: bool = True
+        self.storage_png_compress_level: int = 6
         self.keep_intermediate_ocr_image: bool = False
         self.ocr_whitelist: str | None = None
         # Odoo B&W rendering controls
@@ -101,8 +107,9 @@ class DocumentImage:
         self.odoo_bw_open_kernel: int = 2
         self.odoo_bw_open_iterations: int = 1
         self.odoo_bw_post_dilate_kernel: int = 0  # 0 to disable
-        # Path for produced Odoo/Email output
+        # Paths for produced outputs
         self.odoo_storage_path: Path | None = None
+        self.local_storage_path: Path | None = None
 
         self.config = config
         self.logger = config['logger']
@@ -116,11 +123,15 @@ class DocumentImage:
             self.search_regions = doc_cfg.get('search_regions', doc_cfg.get('regions', []))
             self.ocr_top_half_only = bool(doc_cfg.get('ocr_top_half_only', False))
             self.tesseract_config = doc_cfg.get('tesseract_config', self.tesseract_config)
-            # output options
-            self.storage_png_compress_level = int(
-                doc_cfg.get('storage_png_compress_level', self.storage_png_compress_level))
-            self.keep_intermediate_ocr_image = bool(
-                doc_cfg.get('keep_intermediate_ocr_image', self.keep_intermediate_ocr_image))
+            # storage/output options
+            self.storage_format = doc_cfg.get('storage_format', self.storage_format)
+            self.storage_keep_color = bool(doc_cfg.get('storage_keep_color', self.storage_keep_color))
+            self.storage_jpeg_quality = int(doc_cfg.get('storage_jpeg_quality', self.storage_jpeg_quality))
+            self.storage_jpeg_subsampling = doc_cfg.get('storage_jpeg_subsampling', self.storage_jpeg_subsampling)
+            self.storage_progressive = bool(doc_cfg.get('storage_progressive', self.storage_progressive))
+            self.storage_optimize = bool(doc_cfg.get('storage_optimize', self.storage_optimize))
+            self.storage_png_compress_level = int(doc_cfg.get('storage_png_compress_level', self.storage_png_compress_level))
+            self.keep_intermediate_ocr_image = bool(doc_cfg.get('keep_intermediate_ocr_image', self.keep_intermediate_ocr_image))
             self.ocr_whitelist = doc_cfg.get('ocr_whitelist', self.ocr_whitelist)
             # Odoo B&W rendering options
             self.odoo_storage_bw_method = doc_cfg.get('odoo_storage_bw_method', self.odoo_storage_bw_method)
@@ -131,8 +142,7 @@ class DocumentImage:
             self.odoo_bw_threshold = int(doc_cfg.get('odoo_bw_threshold', self.odoo_bw_threshold))
             self.odoo_bw_open_kernel = int(doc_cfg.get('odoo_bw_open_kernel', self.odoo_bw_open_kernel))
             self.odoo_bw_open_iterations = int(doc_cfg.get('odoo_bw_open_iterations', self.odoo_bw_open_iterations))
-            self.odoo_bw_post_dilate_kernel = int(
-                doc_cfg.get('odoo_bw_post_dilate_kernel', self.odoo_bw_post_dilate_kernel))
+            self.odoo_bw_post_dilate_kernel = int(doc_cfg.get('odoo_bw_post_dilate_kernel', self.odoo_bw_post_dilate_kernel))
 
     @property
     def filename(self) -> str:
@@ -210,12 +220,17 @@ class DocumentImage:
         # Prepare OCR image in-memory (do not overwrite file)
         ocr_img = self._preprocess_for_ocr(color)
 
-        # Produce Odoo (B&W PNG) output
+        # Produce Odoo (B&W PNG) and Local (color WEBP) outputs
         try:
             self.odoo_storage_path = self._save_odoo_storage_bw_image(color)
         except Exception as e:
             self.logger.warning(f"Failed to save Odoo B&W image: {e}")
             self.odoo_storage_path = None
+        try:
+            self.local_storage_path = self._save_local_storage_color_image(color)
+        except Exception as e:
+            self.logger.warning(f"Failed to save local color image: {e}")
+            self.local_storage_path = None
 
         # Prepare OCR base (top-half if configured)
         ocr_base = ocr_img.copy()
@@ -315,8 +330,7 @@ class DocumentImage:
 
         def background_otsu(img_gray: Any) -> Any:
             # Fast denoise
-            gdn = cv2.fastNlMeansDenoising(img_gray, h=max(0, int(self.odoo_bw_denoise_h)), templateWindowSize=7,
-                                           searchWindowSize=21)
+            gdn = cv2.fastNlMeansDenoising(img_gray, h=max(0, int(self.odoo_bw_denoise_h)), templateWindowSize=7, searchWindowSize=21)
             # Estimate smooth background via large median blur on a lightly dilated image
             dil_k = max(1, int(self.odoo_bw_dilate_kernel))
             dil_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dil_k, dil_k))
@@ -382,8 +396,7 @@ class DocumentImage:
         bottom = bw[-frame:, :]
         left = bw[:, 0:frame]
         right = bw[:, -frame:]
-        border_black = ((top == 0).sum() + (bottom == 0).sum() + (left == 0).sum() + (right == 0).sum()) / (
-        (top.size + bottom.size + left.size + right.size))
+        border_black = ( (top==0).sum() + (bottom==0).sum() + (left==0).sum() + (right==0).sum() ) / ( (top.size+bottom.size+left.size+right.size) )
         if border_black > 0.25:
             bw = cv2.bitwise_not(bw)
         # Compute black pixel ratio
@@ -395,12 +408,8 @@ class DocumentImage:
                 blur = cv2.GaussianBlur(gray_dn, (3, 3), 0)
                 bw_fb = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 12)
                 # re-run polarity check
-                top = bw_fb[0:frame, :];
-                bottom = bw_fb[-frame:, :];
-                left = bw_fb[:, 0:frame];
-                right = bw_fb[:, -frame:]
-                border_black_fb = ((top == 0).sum() + (bottom == 0).sum() + (left == 0).sum() + (right == 0).sum()) / (
-                (top.size + bottom.size + left.size + right.size))
+                top = bw_fb[0:frame, :]; bottom = bw_fb[-frame:, :]; left = bw_fb[:, 0:frame]; right = bw_fb[:, -frame:]
+                border_black_fb = ( (top==0).sum() + (bottom==0).sum() + (left==0).sum() + (right==0).sum() ) / ( (top.size+bottom.size+left.size+right.size) )
                 if border_black_fb > 0.25:
                     bw_fb = cv2.bitwise_not(bw_fb)
                 bw = bw_fb
@@ -413,6 +422,38 @@ class DocumentImage:
         out_path = self.file.with_suffix('.png')
         compress_level = int(self.storage_png_compress_level)
         pil_1.save(out_path, format='PNG', optimize=True, compress_level=compress_level)
+        return out_path
+
+    def _save_local_storage_color_image(self, color_bgr) -> Path:
+        """
+        Produce a color image (default WEBP) preserving the original look for local archival.
+        Returns the saved path.
+        """
+        try:
+            den = cv2.fastNlMeansDenoisingColored(color_bgr, None, h=3, hColor=3, templateWindowSize=7, searchWindowSize=21)
+        except Exception:
+            den = color_bgr
+        rgb = cv2.cvtColor(den, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        fmt = (self.storage_format or 'webp').lower()
+        if fmt not in {"jpeg", "jpg", "png", "webp"}:
+            fmt = 'webp'
+        suffix = '.jpg' if fmt in {"jpeg", "jpg"} else '.png' if fmt == 'png' else '.webp'
+        out_path = self.file.with_suffix(suffix)
+        save_kwargs: dict[str, Any] = {}
+        if fmt in {"jpeg", "jpg"}:
+            subsampling_map = {"4:4:4": 0, "4:2:2": 1, "4:2:0": 2}
+            subsampling = subsampling_map.get((self.storage_jpeg_subsampling or "4:2:0"), 2)
+            save_kwargs.update(dict(format="JPEG",
+                                    quality=int(self.storage_jpeg_quality),
+                                    subsampling=subsampling,
+                                    progressive=bool(self.storage_progressive),
+                                    optimize=bool(self.storage_optimize)))
+        elif fmt == 'png':
+            save_kwargs.update(dict(format="PNG", compress_level=int(self.storage_png_compress_level), optimize=True))
+        else:  # webp
+            save_kwargs.update(dict(format="WEBP", quality=int(self.storage_jpeg_quality)))
+        pil.save(out_path, **save_kwargs)
         return out_path
 
     def _preprocess_for_ocr(self, color_bgr) -> Any:
@@ -457,6 +498,44 @@ class DocumentImage:
         pil_1.save(out_path, format='PNG', optimize=True)
         self.file = out_path
 
+    def _save_storage_image(self, color_bgr) -> None:
+        """
+        Save a storage-optimized image that preserves original look (color and dimensions) with reduced file size.
+        Updates `self.file` to point to the new file.
+        """
+        # Mild denoise to help compression without visible loss
+        try:
+            den = cv2.fastNlMeansDenoisingColored(color_bgr, None, h=3, hColor=3, templateWindowSize=7, searchWindowSize=21)
+        except Exception:
+            den = color_bgr
+        rgb = cv2.cvtColor(den, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+
+        # Determine output path/format
+        fmt = (self.storage_format or "jpeg").lower()
+        if fmt not in {"jpeg", "jpg", "png", "webp"}:
+            fmt = "jpeg"
+        suffix = ".jpg" if fmt in {"jpeg", "jpg"} else ".png" if fmt == "png" else ".webp"
+        out_path = self.file.with_suffix(suffix)
+
+        save_kwargs: dict[str, Any] = {}
+        if fmt in {"jpeg", "jpg"}:
+            # Map subsampling
+            subsampling_map = {"4:4:4": 0, "4:2:2": 1, "4:2:0": 2}
+            subsampling = subsampling_map.get((self.storage_jpeg_subsampling or "4:2:0"), 2)
+            save_kwargs.update(dict(format="JPEG",
+                                    quality=int(self.storage_jpeg_quality),
+                                    subsampling=subsampling,
+                                    progressive=bool(self.storage_progressive),
+                                    optimize=bool(self.storage_optimize)))
+        elif fmt == "png":
+            save_kwargs.update(dict(format="PNG", compress_level=int(self.storage_png_compress_level), optimize=True))
+        else:  # webp
+            # Use lossy WebP by default with quality similar to JPEG
+            save_kwargs.update(dict(format="WEBP", quality=int(self.storage_jpeg_quality)))
+
+        pil.save(out_path, **save_kwargs)
+        self.file = out_path
 
     @property
     def document_type(self) -> str:
@@ -694,18 +773,18 @@ class OdooConnector:
                         break
 
             except IndexError as e:
-                message = f"This document {document.name} can not be found in Odoo. Please attach it manually."
-                document._error_mail_message = message
-                self.logger.warning(message)
-                self.logger.exception(e)
-                break
+                    message = f"This document {document.name} can not be found in Odoo. Please attach it manually."
+                    document._error_mail_message = message
+                    self.logger.warning(message)
+                    self.logger.exception(e)
+                    break
 
             except Exception as e:
-                odoo_id = 0
-                retry += 1
-                self.logger.exception(
-                    f"There was a problem getting the document id from Odoo. Retry {retry}/{self.config['retry']}")
-                sleep(self.config['retry_sleep'])
+                    odoo_id = 0
+                    retry += 1
+                    self.logger.exception(
+                        f"There was a problem getting the document id from Odoo. Retry {retry}/{self.config['retry']}")
+                    sleep(self.config['retry_sleep'])
 
         return odoo_id
 
@@ -729,12 +808,10 @@ class OdooConnector:
                         with upload_path.open('rb') as f:
                             data = base64.b64encode(f.read())
                             values = {
-                                'name': document.name.replace('/', '-') + '_' + Path(upload_path).name.replace('/',
-                                                                                                               '-'),
+                                'name': document.name.replace('/', '-') + '_' + Path(upload_path).name.replace('/', '-'),
                                 'res_id': document.odoo_id,
                                 'res_model': self.config['documents'][document.document_type]['odoo_object'],
-                                'attachment_tag_id': self.config['documents'][document.document_type][
-                                    'odoo_attachment_tag_id'],
+                                'attachment_tag_id': self.config['documents'][document.document_type]['odoo_attachment_tag_id'],
                                 'datas': data.decode('ascii')}
                             document.odoo_attachment_id = models.execute_kw(self.db, self.uid, self.password,
                                                                             'ir.attachment', 'create', [values, ])
@@ -744,9 +821,7 @@ class OdooConnector:
                                 'folder_id': self.config['documents'][document.document_type]['odoo_folder_id'],
                                 'active': True,
                             }
-                            document.odoo_document_id = models.execute_kw(self.db, self.uid, self.password,
-                                                                          'documents.document', 'create',
-                                                                          [doc_values, ])
+                            document.odoo_document_id = models.execute_kw(self.db, self.uid, self.password, 'documents.document', 'create', [doc_values, ])
 
                             return document.odoo_document_id
                 else:
@@ -855,9 +930,9 @@ class FileManager:
             try:
                 yield DocumentImage(self.config, document)
             except Exception as e:
-                self.logger.exception(e)
-                self.logger.warning(f"Unable to parse file {document}. IGNORING.")
-                continue
+               self.logger.exception(e)
+               self.logger.warning(f"Unable to parse file {document}. IGNORING.")
+               continue
 
     def done(self, document: DocumentImage) -> str:
         """
@@ -916,8 +991,8 @@ class FileManager:
         if not document.odoo_id or not document.odoo_attachment_id:
             self.logger.warning(f"Document {document.name} file:{document.filename} is not saved to Odoo")
 
-        # Move the original input file to archive location (no reformatting)
-        src_path = document.original_file
+        # We archive the local color image if present, else fall back to original
+        src_path = document.local_storage_path if document.local_storage_path else document.file
         new_file_name = f"{document.name.replace('/', '-')}_id-{document.odoo_id}_aid-{document.odoo_attachment_id}_{Path(src_path).name}"
 
         self.logger.debug(f"Targeting {new_file_name} for file {document.filename}")
@@ -1034,8 +1109,7 @@ def _parse_args():
                             help="The path to the YAML configuration file. Defaults to /etc/docscanner.conf")
         parser.add_argument('-v', '--verbose', dest='debug', action='store_true', help="enable verbose output")
         parser.add_argument('--stats', action='store_true', help="store region statistics in file")
-        parser.add_argument('--keep', action='store_true',
-                            help="Preserve original input files in their original location")
+        parser.add_argument('--keep', action='store_true', help="Preserve original input files in their original location")
         parser.add_argument('file', type=str, nargs='+',
                             help="The file, files or directories to process. Can be more than one. (required)")
 
