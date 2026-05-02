@@ -195,6 +195,89 @@ class TestPipelineE2E:
             f"top mean {top_band_mean:.1f} >= bottom mean {bottom_band_mean:.1f}"
         )
 
+    def test_failure_email_attaches_cleaned_image_not_raw_original(
+        self, harness_inbox: Path, tmp_path: Path
+    ) -> None:
+        """Failure email + unreadable file both carry the CLEANED image,
+        not the raw original. Catches the bug where the source was moved
+        before the email block could read it."""
+        import cv2
+        import numpy as np
+
+        from docscanner import (
+            Archiver, Config, DocumentTypeRegistry, Mailer, OcrEngine,
+            OcrPreparer, OdooClient, Pipeline, ProcessedLedger,
+            StatsTracker, StoragePreparer,
+        )
+
+        config_path = tmp_path / "config.yaml"
+        _write_test_config(config_path, harness_inbox)
+        config = Config.load(str(config_path), "harness")
+        # Force-enable the mailer for this test by setting an error_email;
+        # _write_test_config disables it by default.
+        config.error_email = "test@example.invalid"
+
+        # Spy mailer captures send_failure calls — no real SMTP.
+        captured: list[dict] = []
+
+        class _SpyMailer(Mailer):
+            def __init__(self) -> None:
+                super().__init__("localhost", 1025, "", "")
+
+            def send_failure(self, to_addr, subject, body, attachment=None):
+                captured.append({
+                    "to": to_addr,
+                    "subject": subject,
+                    "body": body,
+                    "attachment": attachment,
+                })
+
+        registry = DocumentTypeRegistry.from_config(config)
+        archiver = Archiver(harness_inbox / "done")
+        ledger = ProcessedLedger(harness_inbox / ".processed_email_test.sqlite3")
+        odoo = OdooClient(
+            url=config.server.url,
+            database=config.server.database,
+            username=config.server.username,
+            password=config.server.password,
+            verify_tls=False,
+        )
+        pipeline = Pipeline(
+            config=config, registry=registry,
+            ocr_preparer=OcrPreparer(), ocr_engine=OcrEngine(config.tesseract_bin),
+            storage_preparer=StoragePreparer(),
+            odoo_client=odoo, archiver=archiver, ledger=ledger,
+            mailer=_SpyMailer(),
+            stats=StatsTracker(harness_inbox / ".stats_email_test.yaml"),
+        )
+
+        # A page that won't OCR-match (random pixels, no INV text).
+        target = harness_inbox / "Customer_Invoice-email-attach-test.jpg"
+        rng = np.random.default_rng(seed=2)
+        page = rng.integers(230, 256, size=(2200, 1700, 3), dtype=np.uint8)
+        cv2.imwrite(str(target), page)
+
+        outcome = pipeline.process(target)
+        assert not outcome.success
+        assert len(captured) == 1, "exactly one failure email should fire"
+        attach = captured[0]["attachment"]
+        assert attach is not None, "email must carry an attachment"
+        name, payload, mime = attach
+        # The attached bytes are the cleaned StoragePreparer output:
+        # mime is image/jpeg or image/png (never application/octet-stream),
+        # filename uses the matching extension, and the payload decodes
+        # as a real image rather than being the raw input bytes.
+        assert mime in {"image/jpeg", "image/png"}, (
+            f"expected cleaned-image mime, got {mime!r}"
+        )
+        assert name.endswith((".jpg", ".png"))
+        decoded = cv2.imdecode(
+            np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_GRAYSCALE
+        )
+        assert decoded is not None, "attached payload must be a decodable image"
+        odoo.close()
+        ledger.close()
+
     def test_unreadable_file_routes_to_unreadable_folder(
         self, harness_inbox: Path, tmp_path: Path
     ) -> None:
@@ -219,10 +302,18 @@ class TestPipelineE2E:
         cv2.imwrite(str(target), page)
         outcome = pipeline.process(target)
         assert not outcome.success
-        unreadable_dest = (
-            harness_inbox / "done" / "unreadable" / target.name
+        # Under v2 the file lands in done/unreadable/ as the CLEANED
+        # version (yellow-stripped, background-snapped) so the office
+        # reviewer gets a readable image, not the messy original. The
+        # extension follows the encoder choice (jpg if ≤300 KB else png).
+        unreadable_dir = harness_inbox / "done" / "unreadable"
+        archived = list(unreadable_dir.glob(f"{target.stem}.*"))
+        assert archived, f"no archived file matching {target.stem}.* in {unreadable_dir}"
+        assert archived[0].suffix in {".jpg", ".png"}, (
+            f"unexpected extension {archived[0].suffix!r}"
         )
-        assert unreadable_dest.exists()
+        # And the source must be removed from the inbox.
+        assert not target.exists()
 
 
 # ---------------------------------------------------------------------------

@@ -1006,13 +1006,31 @@ class Archiver:
         os.replace(tmp_path, dest_path)
         return dest_path
 
-    def archive_unreadable(self, src_path: Path, payload: bytes | None = None) -> Path:
+    def archive_unreadable(
+        self,
+        src_path: Path,
+        payload: bytes | None = None,
+        payload_ext: str = "",
+    ) -> Path:
+        """Route a failed-to-process file into the unreadable folder.
+
+        With ``payload`` provided (cleaned/encoded bytes), write those to
+        ``done/unreadable/<stem>.<payload_ext>`` and unlink the source so
+        the watcher doesn't re-pick-up the file. Without payload, move
+        the source into the folder unchanged.
+        """
         dest_dir: Path = self._root / "unreadable"
         dest_dir.mkdir(parents=True, exist_ok=True)
-        dest_path: Path = dest_dir / src_path.name
         if payload is not None:
+            dest_name: str = f"{src_path.stem}.{payload_ext.lstrip('.')}"
+            dest_path: Path = dest_dir / dest_name
             dest_path.write_bytes(payload)
+            try:
+                src_path.unlink()
+            except FileNotFoundError:
+                pass
         else:
+            dest_path = dest_dir / src_path.name
             # shutil.move handles cross-filesystem (the inbox bind mount
             # may be on a different fs than the done/ tree).
             shutil.move(str(src_path), str(dest_path))
@@ -1316,7 +1334,7 @@ class Pipeline:
             return self._process_inner(source, digest, keep_original)
         except Exception as e:
             self._log.exception("unhandled error processing %s", source)
-            self._handle_failure(source, digest, payload=None, error=str(e))
+            self._handle_failure(source, digest, error=str(e))
             return ProcessOutcome(
                 source, False, None, None, None, None, None, str(e)
             )
@@ -1328,7 +1346,7 @@ class Pipeline:
         doc_type: DocumentType | None = self._registry.classify(source)
         if doc_type is None:
             self._log.warning("no DocumentType matches %s", source.name)
-            self._handle_failure(source, digest, None, "no matching document type")
+            self._handle_failure(source, digest, "no matching document type")
             return ProcessOutcome(
                 source, False, None, None, None, None, None,
                 "no matching document type",
@@ -1337,7 +1355,7 @@ class Pipeline:
         # 2. Read + per-type preprocess
         bgr: BgrImage | None = cv2.imread(str(source))
         if bgr is None:
-            self._handle_failure(source, digest, None, "cv2 could not read file")
+            self._handle_failure(source, digest, "cv2 could not read file")
             return ProcessOutcome(
                 source, False, None, None, None, None, None, "unreadable image"
             )
@@ -1355,7 +1373,7 @@ class Pipeline:
             regex=doc_type.regex,
         )
         if result is None:
-            self._handle_failure(source, digest, None, "OCR did not match regex")
+            self._handle_failure(source, digest, "OCR did not match regex", cleaned=cleaned)
             return ProcessOutcome(
                 source, False, None, None, None, None, None, "OCR miss"
             )
@@ -1377,7 +1395,7 @@ class Pipeline:
         )
         if odoo_id is None:
             self._handle_failure(
-                source, digest, None, f"no Odoo record for {ocr.name}"
+                source, digest, f"no Odoo record for {ocr.name}", cleaned=cleaned,
             )
             return ProcessOutcome(
                 source, False, ocr.name, None, None, None, ocr.region,
@@ -1436,20 +1454,51 @@ class Pipeline:
         self,
         source: Path,
         digest: str,
-        payload: bytes | None,
         error: str,
+        *,
+        cleaned: BgrImage | None = None,
     ) -> None:
+        """Route a failed file into ``done/unreadable/`` and (optionally) email.
+
+        If ``cleaned`` is supplied (we got far enough to preprocess the
+        image — OCR miss, Odoo miss), we encode it once via
+        ``StoragePreparer`` and use those bytes for BOTH the unreadable
+        archive and the email attachment. The reviewer sees the same
+        readable, yellow-stripped, rotation-corrected image the office
+        would have got on success.
+
+        If ``cleaned`` is None (no DocumentType matched, cv2 couldn't
+        read the file, generic exception), we fall back to the raw
+        original bytes with a magic-sniffed MIME.
+        """
         self._log.error("FAIL %s: %s", source.name, error)
+
+        payload: bytes | None = None
+        mime: str = "application/octet-stream"
+        ext: str = ""
+        if cleaned is not None:
+            payload, mime = self._storage_preparer.prepare(cleaned)
+            ext = "jpg" if mime == "image/jpeg" else "png"
+
+        # Snapshot raw bytes BEFORE the move, used as fallback.
+        attach: tuple[str, bytes, str] | None = None
+        if payload is not None:
+            attach = (f"{source.stem}.{ext}", payload, mime)
+        elif source.exists():
+            try:
+                sniffed: str = magic.from_file(str(source), mime=True) or "application/octet-stream"
+            except Exception:
+                sniffed = "application/octet-stream"
+            attach = (source.name, source.read_bytes(), sniffed)
+
         try:
-            self._archiver.archive_unreadable(source, payload)
+            self._archiver.archive_unreadable(source, payload, ext)
         except Exception:
             self._log.exception("could not move %s to unreadable/", source)
         self._ledger.record_failure(digest, source.name)
-        if self._mailer is not None and self._config.error_email:
+
+        if self._mailer is not None and self._config.error_email and attach is not None:
             try:
-                attach: tuple[str, bytes, str] | None = None
-                if source.exists():
-                    attach = (source.name, source.read_bytes(), "application/octet-stream")
                 self._mailer.send_failure(
                     self._config.error_email,
                     subject=f"[scanrunner] could not process {source.name}",
