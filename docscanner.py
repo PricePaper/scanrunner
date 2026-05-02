@@ -396,6 +396,14 @@ class Config:
         self.error_email: str = raw.get("error-email", "")
         self.error_mail_message: str = raw.get("error-mail-message", "")
         self.statistics_file: str = raw.get("statistics-file", "statistics.yaml")
+        # Concurrency knobs. Defaults are tuned for steady-state scanning
+        # (≈ 1 file every 5 s, rarely overlapping) on a small box. Two
+        # workers cover the occasional scanner burst-of-two; each gets
+        # two cv2 threads so a lone in-flight file uses 2 of the 4
+        # production cores instead of 1. Bump both if your inbox is
+        # genuinely bursty.
+        self.workers: int = int(raw.get("workers", 2))
+        self.cv2_threads: int = int(raw.get("cv2-threads", 2))
         self.documents: dict[str, DocumentTypeConfig] = {}
         for name, doc in (raw.get("documents") or {}).items():
             try:
@@ -1259,8 +1267,10 @@ class Pipeline:
     @classmethod
     def for_worker(cls, config_path: str, server_name: str, inbox: Path) -> Self:
         """Build a Pipeline inside a worker process. Reuse for every file."""
-        cv2.setNumThreads(1)
         config: Config = Config.load(config_path, server_name)
+        # cv2 thread count is per-worker. Tuned alongside `workers` so
+        # `workers * cv2_threads` stays at or below the box's core count.
+        cv2.setNumThreads(max(1, config.cv2_threads))
         registry: DocumentTypeRegistry = DocumentTypeRegistry.from_config(config)
         archiver: Archiver = Archiver(inbox / config.done_path.lstrip("/"))
         ledger: ProcessedLedger = ProcessedLedger(inbox / ".processed.sqlite3")
@@ -1468,10 +1478,11 @@ class WorkSubmitter:
         self._config_path: str = config_path
         self._server_name: str = server_name
         self._inbox: Path = inbox
-        # Production daemon: leave one core for the OS / watcher and use the
-        # rest. The desktop-friendly nproc//3 cap is only for one-shot tools
-        # like calibrate_storage.py that run alongside an interactive session.
-        self._max_workers: int = max_workers or max(1, (os.cpu_count() or 1) - 1)
+        # `max_workers` from the caller (Daemon reads `workers:` from
+        # config.yaml). If left None, fall back to a single worker —
+        # appropriate for the typical 1-file-every-5-seconds production
+        # arrival rate. Override in YAML for genuinely bursty inboxes.
+        self._max_workers: int = max_workers or 1
         # forkserver: predictable startup, no fork-after-thread foot-gun.
         ctx: Any = get_context("forkserver")
         self._pool: ProcessPoolExecutor = ProcessPoolExecutor(
@@ -1599,8 +1610,12 @@ class Daemon:
             logging.getLogger(noisy).setLevel(logging.WARNING)
         self._log: logging.Logger = logging.getLogger("scanrunner.daemon")
         self._inbox: Path = Path(inbox)
+        # Pull worker count from the YAML so the same image can run on a
+        # 4-core prod box and a multi-core dev workstation with sensible
+        # behavior on each.
+        config: Config = Config.load(config_path, server_name)
         self._submitter: WorkSubmitter = WorkSubmitter(
-            config_path, server_name, self._inbox
+            config_path, server_name, self._inbox, max_workers=config.workers,
         )
         self._watcher: FileWatcher = FileWatcher(self._inbox, self._submitter)
         self._stop: threading.Event = threading.Event()
