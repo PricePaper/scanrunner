@@ -78,7 +78,6 @@ buildah config \
   --env DS_SERVER=production \
   --user scanner \
   --workingdir /scanner \
-  --entrypoint '[]' \
   --cmd '["/usr/bin/tini","--","/docscanner.py","daemon","/scanner"]' \
   --label "maintainer=Ean J Price <ean@pricepaper.com>" \
   --label "org.opencontainers.image.title=scanrunner" \
