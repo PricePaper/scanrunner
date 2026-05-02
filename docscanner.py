@@ -354,6 +354,12 @@ class DocumentTypeConfig:
     odoo_object: str
     odoo_attachment_tag_id: int
     odoo_folder_id: int
+    # Optional cascade fallbacks. Defaults are no-op (matches today's
+    # single-attempt behavior). The cascade fires only if the primary OCR
+    # misses, so the fast path is unaffected.
+    fallback_search_regions: tuple[tuple[Region, ...], ...] = ()
+    fallback_tesseract_configs: tuple[str, ...] = ()
+    ocr_try_rotation: bool = False
 
 
 class Config:
@@ -406,6 +412,14 @@ class Config:
                     odoo_object=doc["odoo_object"],
                     odoo_attachment_tag_id=int(doc["odoo_attachment_tag_id"]),
                     odoo_folder_id=int(doc["odoo_folder_id"]),
+                    fallback_search_regions=tuple(
+                        tuple(Region.from_list(r) for r in region_set)
+                        for region_set in doc.get("fallback_search_regions", [])
+                    ),
+                    fallback_tesseract_configs=tuple(
+                        doc.get("fallback_tesseract_configs", [])
+                    ),
+                    ocr_try_rotation=bool(doc.get("ocr_try_rotation", False)),
                 )
             except KeyError as e:
                 raise ConfigError(
@@ -484,6 +498,20 @@ class OcrMatch:
     region: Region
 
 
+@dataclass(frozen=True, slots=True)
+class OcrResult:
+    """Cascade outcome.
+
+    ``rotation_degrees`` is the angle (0 / 90 / 180 / 270) the cascade
+    applied to the image to produce ``match``. Downstream consumers
+    re-apply the same rotation to their input so the storage / archive
+    representation comes out right-side-up.
+    """
+
+    match: OcrMatch
+    rotation_degrees: int
+
+
 class OcrEngine:
     """Run Tesseract on each region in priority order; first regex hit wins.
 
@@ -493,10 +521,15 @@ class OcrEngine:
 
     OCR output is normalized before matching: whitespace and common stray
     punctuation are stripped, so "INV,/2026 /05000" still matches.
+
+    For documents that may arrive sideways or upside down or that need
+    fallback regions/PSMs, use ``extract_with_fallbacks`` — it cascades
+    through tier-by-tier and reports the rotation that worked.
     """
 
     UPSCALE_FACTOR: ClassVar[int] = 2
     NOISE_CHARS: ClassVar[re.Pattern[str]] = re.compile(r"[\s,.;:_|\\]")
+    ROTATION_ANGLES: ClassVar[tuple[int, ...]] = (90, 180, 270)
 
     def __init__(self, tesseract_bin: str = "/usr/bin/tesseract") -> None:
         pytesseract.pytesseract.tesseract_cmd = tesseract_bin
@@ -526,6 +559,57 @@ class OcrEngine:
             match: re.Match[str] | None = regex.search(normalized)
             if match:
                 return OcrMatch(name=match.group(0), region=region)
+        return None
+
+    def extract_with_fallbacks(
+        self,
+        binary: GrayImage,
+        primary_regions: tuple[Region, ...],
+        primary_config: str,
+        fallback_regions: tuple[tuple[Region, ...], ...],
+        fallback_configs: tuple[str, ...],
+        try_rotation: bool,
+        regex: re.Pattern[str],
+    ) -> OcrResult | None:
+        """Cascade until a regex hit lands, or return None.
+
+        Tier 1: primary regions × primary config (the fast path).
+        Tier 2: each fallback region set × primary config.
+        Tier 3: each fallback PSM/config × primary regions.
+        Tier 4: rotate 90/180/270 and re-run primary regions × primary config.
+
+        First hit wins; later tiers are not consulted. Worst case for a
+        hard miss with the Invoice config is ~7 Tesseract calls.
+        """
+        # Tier 1: primary
+        match: OcrMatch | None = self.extract(
+            binary, primary_regions, regex, primary_config
+        )
+        if match is not None:
+            return OcrResult(match=match, rotation_degrees=0)
+
+        # Tier 2: fallback regions
+        for region_set in fallback_regions:
+            match = self.extract(binary, region_set, regex, primary_config)
+            if match is not None:
+                return OcrResult(match=match, rotation_degrees=0)
+
+        # Tier 3: fallback configs (e.g., PSM 11/12)
+        for config in fallback_configs:
+            match = self.extract(binary, primary_regions, regex, config)
+            if match is not None:
+                return OcrResult(match=match, rotation_degrees=0)
+
+        # Tier 4: rotate the binary in 90° increments and retry primary.
+        if try_rotation:
+            for angle in self.ROTATION_ANGLES:
+                rotated: GrayImage = np.rot90(binary, k=angle // 90)
+                match = self.extract(
+                    rotated, primary_regions, regex, primary_config
+                )
+                if match is not None:
+                    return OcrResult(match=match, rotation_degrees=angle)
+
         return None
 
 
@@ -1249,20 +1333,33 @@ class Pipeline:
             )
         cleaned: BgrImage = doc_type.preprocess(bgr)
 
-        # 3. OCR pass
+        # 3. OCR pass — cascade through fallbacks if the primary misses.
         binary: GrayImage = self._ocr_preparer.binarize(cleaned)
-        ocr: OcrMatch | None = self._ocr_engine.extract(
+        result: OcrResult | None = self._ocr_engine.extract_with_fallbacks(
             binary,
-            doc_type.config.search_regions,
-            doc_type.regex,
-            doc_type.config.tesseract_config,
+            primary_regions=doc_type.config.search_regions,
+            primary_config=doc_type.config.tesseract_config,
+            fallback_regions=doc_type.config.fallback_search_regions,
+            fallback_configs=doc_type.config.fallback_tesseract_configs,
+            try_rotation=doc_type.config.ocr_try_rotation,
+            regex=doc_type.regex,
         )
-        if ocr is None:
+        if result is None:
             self._handle_failure(source, digest, None, "OCR did not match regex")
             return ProcessOutcome(
                 source, False, None, None, None, None, None, "OCR miss"
             )
-        self._log.info("OCR extracted %s from %s", ocr.name, source.name)
+        ocr: OcrMatch = result.match
+        if result.rotation_degrees:
+            self._log.info(
+                "OCR extracted %s from %s (rotated %d°)",
+                ocr.name, source.name, result.rotation_degrees,
+            )
+            # Keep storage / archive in the orientation that OCR succeeded
+            # at — the office reviewer never sees a sideways scan.
+            cleaned = np.rot90(cleaned, k=result.rotation_degrees // 90)
+        else:
+            self._log.info("OCR extracted %s from %s", ocr.name, source.name)
 
         # 4. Odoo lookup
         odoo_id: int | None = self._odoo.find_record(
@@ -1277,7 +1374,7 @@ class Pipeline:
                 "Odoo record not found",
             )
 
-        # 5. Storage prep
+        # 5. Storage prep — uses the rotation-corrected `cleaned` array.
         payload: bytes
         mime: str
         payload, mime = self._storage_preparer.prepare(cleaned)

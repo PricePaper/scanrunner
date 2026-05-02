@@ -17,6 +17,26 @@ INV_GOOD = PROJECT_ROOT / "inv" / "good"
 INV_UNREADABLE = PROJECT_ROOT / "inv" / "unreadable"
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "slow: tests that take long enough to skip by default; "
+        "run with `pytest -m slow` to include.",
+    )
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Skip @pytest.mark.slow by default; opt in with `-m slow`."""
+    if config.getoption("-m"):
+        return
+    skip_slow = pytest.mark.skip(reason="slow; opt in with `-m slow`")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip_slow)
+
+
 @pytest.fixture(scope="session")
 def project_root() -> Path:
     return PROJECT_ROOT

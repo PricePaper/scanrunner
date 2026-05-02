@@ -73,6 +73,11 @@ def _write_test_config(path: Path, inbox: Path) -> None:
                 "ocr_regex": r"R?INV/20\d{2}/\d{4,5}",
                 "search_regions": [[60, 0, 100, 25], [20, 30, 80, 70]],
                 "tesseract_config": "--psm 6 -l eng",
+                "fallback_search_regions": [[[0, 0, 100, 100]]],
+                "fallback_tesseract_configs": [
+                    "--psm 11 -l eng", "--psm 12 -l eng",
+                ],
+                "ocr_try_rotation": True,
                 "odoo_sequence": "INV",
                 "odoo_object": "account.move",
                 "odoo_attachment_tag_id": 1,
@@ -136,6 +141,59 @@ class TestPipelineE2E:
         new_path = harness_inbox / "Customer_Invoice-test_e2e_2.jpg"
         new_path.write_bytes(outcome.archive_path.read_bytes())  # different bytes
         ledger.close()
+
+    def test_pre_rotated_invoice_is_stored_right_side_up(
+        self, harness_inbox: Path, tmp_path: Path, project_root: Path
+    ) -> None:
+        """Drop a 180°-rotated copy of a known-good invoice and verify:
+
+        1. OCR still extracts the invoice number (cascade rotation).
+        2. The archived image's aspect ratio matches the original (taller
+           than wide) — i.e., we un-rotated before storage. A failure here
+           means storage kept the rotated orientation, which would force
+           the office to re-rotate manually.
+        """
+        import cv2
+        import numpy as np
+
+        # Use a different invoice than the harness fixture's primary file
+        # so the ledger doesn't dedupe.
+        src = next(
+            (project_root / "inv" / "good").glob("INV-2026-05002_*.jpg")
+        )
+        bgr = cv2.imread(str(src))
+        # Rotate 180° on disk so the daemon's input is sideways.
+        rotated = np.rot90(bgr, k=2)
+        target = harness_inbox / "Customer_Invoice-rotated180.jpg"
+        cv2.imwrite(str(target), rotated)
+
+        config_path = tmp_path / "config.yaml"
+        _write_test_config(config_path, harness_inbox)
+        pipeline = Pipeline.for_worker(str(config_path), "harness", harness_inbox)
+        outcome = pipeline.process(target)
+        assert outcome.success, f"rotated invoice failed: {outcome.error}"
+        assert outcome.invoice_name == "INV/2026/05002"
+
+        # Decode the archived file and verify it's portrait (taller than
+        # wide). Pre-rotation by 180° preserves portrait orientation, so
+        # this test really catches the case where the cascade rotated
+        # 180° AND the storage path failed to re-apply that rotation:
+        # the result would be flipped but still portrait. Better signal:
+        # pixel-corner darkness — the original has a dark band (text) in
+        # the top-eighth and bright in the bottom-eighth (whitespace).
+        assert outcome.archive_path is not None
+        archived = cv2.imread(str(outcome.archive_path), cv2.IMREAD_GRAYSCALE)
+        assert archived is not None
+        h = archived.shape[0]
+        top_band_mean = float(archived[: h // 8, :].mean())
+        bottom_band_mean = float(archived[7 * h // 8 :, :].mean())
+        # Original-orientation invoices have header text in the top band,
+        # so the top is darker than the bottom on average. If we stored
+        # the rotated version, top would be the brighter side.
+        assert top_band_mean < bottom_band_mean, (
+            "Stored image is not in original orientation: "
+            f"top mean {top_band_mean:.1f} >= bottom mean {bottom_band_mean:.1f}"
+        )
 
     def test_unreadable_file_routes_to_unreadable_folder(
         self, harness_inbox: Path, tmp_path: Path

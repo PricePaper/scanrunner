@@ -13,6 +13,7 @@ from docscanner import (
     OcrEngine,
     OcrMatch,
     OcrPreparer,
+    OcrResult,
     Region,
     YellowRemover,
 )
@@ -142,3 +143,124 @@ class TestOcrEngine:
             f"First region (top-right) should win, got {match.name}"
         )
         assert match.region == regions[0]
+
+
+# ---------------------------------------------------------------------------
+# OcrEngine.extract_with_fallbacks — cascade contract
+# ---------------------------------------------------------------------------
+
+
+def _make_invoice_page(text_in_top_right: str | None,
+                       text_in_body: str | None) -> np.ndarray:
+    """Synthetic invoice-shaped page (1700×2200 white). Optional text in
+    top-right header and/or body."""
+    page = np.full((2200, 1700), 255, dtype=np.uint8)
+    if text_in_top_right:
+        cv2.putText(page, text_in_top_right, (1100, 200),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, 0, 4)
+    if text_in_body:
+        cv2.putText(page, text_in_body, (200, 1500),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, 0, 4)
+    return page
+
+
+class TestExtractWithFallbacks:
+    PRIMARY = (Region(50, 0, 100, 20),)               # top-right only
+    BODY_ONLY = (Region(0, 30, 60, 80),)              # body region
+    FULL_PAGE = (Region(0, 0, 100, 100),)             # whole page
+    REGEX = re.compile(r"R?INV/20\d{2}/\d{4,5}")
+    PRIMARY_CFG = "--psm 6 -l eng"
+
+    def test_primary_wins_no_rotation(self, tesseract_bin: str) -> None:
+        page = _make_invoice_page("INV/2026/05000", None)
+        binary = OcrPreparer().binarize(page)
+        engine = OcrEngine(tesseract_bin)
+        result = engine.extract_with_fallbacks(
+            binary,
+            primary_regions=self.PRIMARY,
+            primary_config=self.PRIMARY_CFG,
+            fallback_regions=(self.FULL_PAGE,),
+            fallback_configs=("--psm 11 -l eng",),
+            try_rotation=True,
+            regex=self.REGEX,
+        )
+        assert result is not None
+        assert result.match.name == "INV/2026/05000"
+        assert result.rotation_degrees == 0
+
+    def test_fallback_region_wins_when_primary_misses(
+        self, tesseract_bin: str
+    ) -> None:
+        # Number is in the body, not the top-right primary region.
+        page = _make_invoice_page(None, "INV/2026/05001")
+        binary = OcrPreparer().binarize(page)
+        engine = OcrEngine(tesseract_bin)
+        result = engine.extract_with_fallbacks(
+            binary,
+            primary_regions=self.PRIMARY,           # body excluded
+            primary_config=self.PRIMARY_CFG,
+            fallback_regions=(self.FULL_PAGE,),     # full page picks it up
+            fallback_configs=(),
+            try_rotation=False,
+            regex=self.REGEX,
+        )
+        assert result is not None
+        assert result.match.name == "INV/2026/05001"
+        assert result.rotation_degrees == 0
+
+    def test_rotation_180_wins(self, tesseract_bin: str) -> None:
+        page = _make_invoice_page("INV/2026/05002", None)
+        # Rotate 180° so primary OCR fails until the cascade rotates it back.
+        page_rot = np.rot90(page, k=2)
+        binary = OcrPreparer().binarize(page_rot)
+        engine = OcrEngine(tesseract_bin)
+        result = engine.extract_with_fallbacks(
+            binary,
+            primary_regions=self.PRIMARY,
+            primary_config=self.PRIMARY_CFG,
+            fallback_regions=(),
+            fallback_configs=(),
+            try_rotation=True,
+            regex=self.REGEX,
+        )
+        assert result is not None
+        assert result.match.name == "INV/2026/05002"
+        assert result.rotation_degrees == 180
+
+    def test_all_miss_returns_none(self, tesseract_bin: str) -> None:
+        page = _make_invoice_page(None, "Source: SO/2026/77777")  # SO never matches INV
+        binary = OcrPreparer().binarize(page)
+        engine = OcrEngine(tesseract_bin)
+        result = engine.extract_with_fallbacks(
+            binary,
+            primary_regions=self.PRIMARY,
+            primary_config=self.PRIMARY_CFG,
+            fallback_regions=(self.FULL_PAGE,),
+            fallback_configs=("--psm 11 -l eng",),
+            try_rotation=True,
+            regex=self.REGEX,
+        )
+        assert result is None
+
+    def test_no_fallbacks_no_rotation_matches_extract_behavior(
+        self, tesseract_bin: str
+    ) -> None:
+        """With empty fallbacks and rotation off, cascade is just `extract`."""
+        page = _make_invoice_page("INV/2026/05003", None)
+        binary = OcrPreparer().binarize(page)
+        engine = OcrEngine(tesseract_bin)
+        result = engine.extract_with_fallbacks(
+            binary,
+            primary_regions=self.PRIMARY,
+            primary_config=self.PRIMARY_CFG,
+            fallback_regions=(),
+            fallback_configs=(),
+            try_rotation=False,
+            regex=self.REGEX,
+        )
+        direct = engine.extract(
+            binary, self.PRIMARY, self.REGEX, self.PRIMARY_CFG
+        )
+        assert result is not None and direct is not None
+        assert result.match == direct
+        assert result.rotation_degrees == 0
