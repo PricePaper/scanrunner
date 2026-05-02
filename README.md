@@ -49,7 +49,11 @@ uv run --script docscanner.py daemon /path/to/inbox \
 Container (recommended for production):
 
 ```bash
-podman build -t scanrunner:dev .
+# Build a single-layer image with date-stamped + latest tags.
+# Default registry is registry.digitalocean.com/pricepaper/scanrunner;
+# override with IMAGE_REPO=… ./build.sh.
+./build.sh
+# Output prints two `podman push <tag>` lines you can copy/paste.
 
 # Bind-mount the Samba inbox at /scanner and the config at
 # /etc/docscanner/. --userns=keep-id maps the host user to the container's
@@ -64,7 +68,7 @@ podman run -d --name scanrunner \
     -e DS_PROD_SMTP_PASSWORD='...' \
     -v /srv/scanner-inbox:/scanner:Z \
     -v /etc/docscanner:/etc/docscanner:Z,ro \
-    scanrunner:dev
+    registry.digitalocean.com/pricepaper/scanrunner:latest
 ```
 
 Config secrets use shell-style `${VAR}` interpolation, so `config.yaml`
