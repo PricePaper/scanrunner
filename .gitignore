@@ -2,3 +2,18 @@ config.yaml
 scanner.bak/
 scanner/
 
+.run-config/
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+tmp/
+
+# Sample data (large; tracked separately if needed)
+inv/
+inv.tar.zstd
+
+# Local notes / scratch
+prompt.txt
+old/
