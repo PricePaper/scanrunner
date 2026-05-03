@@ -13,6 +13,7 @@ tmp/
 # Sample data (large; tracked separately if needed)
 inv/
 inv.tar.zstd
+samples/
 
 # Local notes / scratch
 prompt.txt

@@ -85,8 +85,19 @@ class YellowRemover:
 
     HUE_LOW: ClassVar[int] = 15
     HUE_HIGH: ClassVar[int] = 45
-    SAT_MIN: ClassVar[int] = 40
-    VAL_MIN: ClassVar[int] = 80
+    SAT_MIN: ClassVar[int] = 100
+    """Pure yellow paper has S≈140-180 on this scanner; partial-coverage
+    edge mixes (where dark ink shows through paper) drop to S≈60-90.
+    100 cleanly distinguishes paper from edge-mix pixels — the latter
+    must NOT be classified as paper or pen-stroke anti-aliasing gets
+    eaten and signatures arrive at the encoder as fragments."""
+
+    VAL_MIN: ClassVar[int] = 170
+    """Pure yellow paper has V≈210-230. Anti-aliased ink edges have
+    V≈100-150. The old VAL_MIN=80 caught the edges (V≥80 trivially)
+    and snapped them white — destroying ~74 % of pixels in [50, 200)
+    on the inv/good/INV-2026-05020/0002 sample. 170 keeps confident
+    paper in the mask, drops edge mixes."""
 
     def remove(self, bgr: BgrImage) -> BgrImage:
         if bgr.ndim != 3 or bgr.shape[2] != 3:
@@ -150,7 +161,16 @@ class BackgroundSnapper:
     """
 
     THRESHOLD_OFFSET: ClassVar[int] = 35
-    """Pixels darker than (local_background - this) are foreground."""
+    """Pixels darker than (local_background - this) are foreground.
+
+    35 keeps routine paper texture quiet AND preserves anti-aliased
+    ink edges (which arrive at 100-150 V values, comfortably below
+    local_mean - 35). An earlier "drop to 20" attempt was chasing a
+    faint-ink-survival problem that turned out to be in YellowRemover;
+    once that was fixed the snapper could go back to a clean 35
+    without losing real ink, and the page-wide gray speckle that came
+    with the 20 setting goes away.
+    """
 
     def snap(self, img: BgrImage | GrayImage) -> tuple[GrayImage, GrayImage]:
         """Return (snapped grayscale image, foreground mask)."""
@@ -171,6 +191,99 @@ class BackgroundSnapper:
         return snapped, fg_mask
 
 
+class FaintInkRescuer:
+    """Iterative second-pass snap that rescues faint ink adjacent to detected strokes.
+
+    The primary ``BackgroundSnapper`` may miss the lightest pixels of a
+    pen-stroke halo. This class dilates the existing foreground mask
+    (anywhere ink was already detected → the stroke "neighborhood"),
+    re-runs adaptive threshold inside that neighborhood with a more
+    permissive offset, and writes the rescued faint pixels'
+    flattened-grayscale tone back into the snapped image. The pass
+    repeats — the just-rescued faint pixels become anchors for the next
+    iteration, letting a long chain of progressively-fainter ink grow
+    outward in waves.
+
+    Seed-area filter: only connected components ≥ MIN_SEED_AREA can
+    anchor a rescue. Stops paper-shadow speckle (~1-5 px components)
+    from snowballing into gray blotches over multiple iterations.
+    Isolated faint regions with no detected anchor stay snapped to
+    white — each iteration only grows from existing detected ink,
+    never bridges across pure paper.
+    """
+
+    NEIGHBORHOOD_RADIUS: ClassVar[int] = 20
+    """Pixels within this many of an existing foreground pixel are
+    eligible for rescue per iteration."""
+
+    RESCUE_THRESHOLD_OFFSET: ClassVar[int] = 8
+    """Adaptive-threshold C used inside the neighborhood. Smaller than
+    BackgroundSnapper.THRESHOLD_OFFSET — once we know we're near real
+    ink, we can be more aggressive about catching its faint ends."""
+
+    BLOCK_SIZE: ClassVar[int] = 51
+
+    MAX_ITERATIONS: ClassVar[int] = 3
+    """Hard cap on rescue passes. Three passes (~60 px reach) covers
+    real signature stroke halos without letting rescue walk across the
+    page into adjacent paper-shadow regions."""
+
+    MIN_SEED_AREA: ClassVar[int] = 20
+    """Connected components in the input fg_mask smaller than this
+    cannot anchor a rescue. Real ink strokes (≥50 px) and check marks
+    pass; sub-10-px speckle drops out."""
+
+    def rescue(
+        self,
+        snapped: GrayImage,
+        fg_mask: GrayImage,
+        flat: BgrImage | GrayImage,
+    ) -> tuple[GrayImage, GrayImage]:
+        """Return (updated snapped, updated foreground mask)."""
+        flat_gray: GrayImage = (
+            flat if flat.ndim == 2 else cv2.cvtColor(flat, cv2.COLOR_BGR2GRAY)
+        )
+        n_labels: int
+        labels: np.ndarray
+        stats: np.ndarray
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            fg_mask, connectivity=8
+        )
+        seed_mask: GrayImage = np.zeros_like(fg_mask)
+        for i in range(1, n_labels):
+            if stats[i, cv2.CC_STAT_AREA] >= self.MIN_SEED_AREA:
+                seed_mask[labels == i] = 255
+        kernel: np.ndarray = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (self.NEIGHBORHOOD_RADIUS * 2 + 1, self.NEIGHBORHOOD_RADIUS * 2 + 1),
+        )
+        permissive_mask: GrayImage = cv2.adaptiveThreshold(
+            flat_gray,
+            255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY_INV,
+            blockSize=self.BLOCK_SIZE,
+            C=self.RESCUE_THRESHOLD_OFFSET,
+        )
+        out: GrayImage = snapped.copy()
+        current_mask: GrayImage = fg_mask.copy()
+        iter_anchor: GrayImage = seed_mask.copy()
+        for _ in range(self.MAX_ITERATIONS):
+            neighborhood: GrayImage = cv2.dilate(iter_anchor, kernel)
+            new_fg: np.ndarray = (
+                (permissive_mask > 0)
+                & (neighborhood > 0)
+                & (current_mask == 0)
+            )
+            if not new_fg.any():
+                break
+            out[new_fg] = flat_gray[new_fg]
+            new_fg_u8: GrayImage = new_fg.astype(np.uint8) * 255
+            current_mask = current_mask | new_fg_u8
+            iter_anchor = iter_anchor | new_fg_u8
+        return out, current_mask
+
+
 class EdgeCleaner:
     """Drop isolated foreground speckle (paper fiber, toner spray); keep strokes."""
 
@@ -189,6 +302,86 @@ class EdgeCleaner:
             area: int = stats[label, cv2.CC_STAT_AREA]
             if area < self.MIN_COMPONENT_AREA:
                 out[labels == label] = 255
+        return out
+
+
+class EdgeCrispener:
+    """Snap text-edge anti-aliasing halos to pure white; keep signature bodies.
+
+    A halo pixel is intermediate-tone AND adjacent (within a few pixels)
+    to a strong-black region. A signature-body pixel is intermediate-tone
+    AND surrounded by other intermediate-tone pixels. The first kind costs
+    PNG bytes for cosmetic anti-aliasing the eye barely notices; the
+    second kind is the actual document content we promised to preserve.
+    """
+
+    DARK_THRESHOLD: ClassVar[int] = 60        # pixels ≤ this count as "dark stroke"
+    INTERMEDIATE_LOW: ClassVar[int] = 40
+    INTERMEDIATE_HIGH: ClassVar[int] = 230
+    HALO_DILATE_RADIUS: ClassVar[int] = 3     # halo extends this far from dark
+    SIGNATURE_WINDOW: ClassVar[int] = 9       # local context window
+    SIGNATURE_MIN_INTERMEDIATE_FRACTION: ClassVar[float] = 0.35
+
+    def crispen(self, snapped: GrayImage) -> GrayImage:
+        """Return ``snapped`` with halos snapped to 255, bodies untouched."""
+        dark_mask: GrayImage = (snapped <= self.DARK_THRESHOLD).astype(np.uint8) * 255
+        kernel: np.ndarray = cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (self.HALO_DILATE_RADIUS * 2 + 1, self.HALO_DILATE_RADIUS * 2 + 1),
+        )
+        near_dark: GrayImage = cv2.dilate(dark_mask, kernel)
+        intermediate_mask: GrayImage = (
+            (snapped > self.INTERMEDIATE_LOW)
+            & (snapped < self.INTERMEDIATE_HIGH)
+        ).astype(np.uint8) * 255
+        # Local fraction of intermediates in a window. A signature body
+        # has a high fraction (its neighborhood is mostly itself); a halo
+        # has a low fraction (its neighborhood is dark + white, with the
+        # halo a thin ring).
+        kernel_window: np.ndarray = np.ones(
+            (self.SIGNATURE_WINDOW, self.SIGNATURE_WINDOW), dtype=np.float32
+        ) / float(self.SIGNATURE_WINDOW * self.SIGNATURE_WINDOW)
+        local_intermediate_frac: np.ndarray = cv2.filter2D(
+            (intermediate_mask > 0).astype(np.float32), -1, kernel_window,
+        )
+        signature_body: np.ndarray = (
+            local_intermediate_frac >= self.SIGNATURE_MIN_INTERMEDIATE_FRACTION
+        )
+        halo_mask: np.ndarray = (
+            (intermediate_mask > 0)
+            & (near_dark > 0)
+            & ~signature_body
+        )
+        out: GrayImage = snapped.copy()
+        out[halo_mask] = 255
+        return out
+
+
+class ForegroundQuantizer:
+    """Collapse foreground intensities to N evenly-spaced bins.
+
+    PNG deflate compresses far better when the foreground alphabet is
+    small. 16 levels (default) keeps signature legibility while reducing
+    storage; 8 risks visible banding on ink gradients.
+    """
+
+    DEFAULT_LEVELS: ClassVar[int] = 16
+    BACKGROUND_THRESHOLD: ClassVar[int] = 240   # pixels ≥ this are paper
+
+    def __init__(self, levels: int = DEFAULT_LEVELS) -> None:
+        if not 2 <= levels <= 256:
+            raise ValueError(f"levels must be in [2, 256], got {levels}")
+        self._levels: int = levels
+        # Pre-compute the bin centers (evenly spaced 0..255).
+        step: float = 255.0 / (levels - 1)
+        self._lut: np.ndarray = np.arange(256, dtype=np.float32)
+        self._lut = (np.round(self._lut / step) * step).astype(np.uint8)
+
+    def quantize(self, snapped: GrayImage) -> GrayImage:
+        """Quantize foreground pixels; leave near-paper pixels exactly 255."""
+        background: np.ndarray = snapped >= self.BACKGROUND_THRESHOLD
+        out: GrayImage = cv2.LUT(snapped, self._lut)
+        out[background] = 255
         return out
 
 
@@ -259,12 +452,18 @@ class StoragePreparer:
         self,
         flattener: BackgroundFlattener | None = None,
         snapper: BackgroundSnapper | None = None,
+        rescuer: FaintInkRescuer | None = None,
         edge_cleaner: EdgeCleaner | None = None,
+        edge_crispener: EdgeCrispener | None = None,
+        quantizer: ForegroundQuantizer | None = None,
         encoder: Encoder | None = None,
     ) -> None:
         self._flattener = flattener or BackgroundFlattener()
         self._snapper = snapper or BackgroundSnapper()
+        self._rescuer = rescuer or FaintInkRescuer()
         self._edge_cleaner = edge_cleaner or EdgeCleaner()
+        self._edge_crispener = edge_crispener or EdgeCrispener()
+        self._quantizer = quantizer or ForegroundQuantizer()
         self._encoder = encoder or Encoder()
 
     def prepare(self, cleaned: BgrImage | GrayImage) -> tuple[bytes, str]:
@@ -277,7 +476,14 @@ class StoragePreparer:
         snapped: GrayImage
         fg_mask: GrayImage
         snapped, fg_mask = self._snapper.snap(flat)
+        snapped, fg_mask = self._rescuer.rescue(snapped, fg_mask, flat)
         snapped = self._edge_cleaner.clean(snapped, fg_mask)
+        # Compaction primitives (EdgeCrispener, ForegroundQuantizer) are
+        # implemented but NOT wired into the production chain. Both were
+        # tried and both damaged faint handwriting / printed text in
+        # ways the office found unacceptable. They remain available as
+        # building blocks if a future change wants them under different
+        # parameters.
         return self._encoder.encode(snapped)
 
 
