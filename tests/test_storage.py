@@ -1,7 +1,7 @@
 """Contract tests for StoragePreparer and Encoder.
 
 These verify the production reproduction guarantee end-to-end on real
-inv/good/ samples: pure-white background, faithful foreground, fixed
+corpus/invoices/good/ samples: pure-white background, faithful foreground, fixed
 calibrated encoder settings, JPEG≤300KB-or-PNG-fallback rule.
 """
 

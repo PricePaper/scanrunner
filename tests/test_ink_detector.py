@@ -83,7 +83,7 @@ class TestInkRegionDetector:
         """Real-world contract: a sample with a clear handwritten
         signature gets a mask that covers the signature region."""
         sample = (
-            project_root / "inv" / "good"
+            project_root / "corpus" / "invoices" / "good"
             / "INV-2026-05015_id-973750_aid-430545_Customer_Invoice-20260430_084849_0020.jpg"
         )
         if not sample.exists():

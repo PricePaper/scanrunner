@@ -121,7 +121,7 @@ class TestYellowRemover:
     def test_real_invoice_pen_signature_survives_yellow_removal(
         self, project_root: Path
     ) -> None:
-        """Regression: stage-by-stage probe of inv/good/INV-2026-05020/0002
+        """Regression: stage-by-stage probe of corpus/invoices/good/INV-2026-05020/0002
         showed pen ink (handwritten note + signature on yellow paper)
         was being mostly destroyed by YellowRemover before any other
         stage ran.
@@ -137,7 +137,7 @@ class TestYellowRemover:
         survive yellow removal.
         """
         sample = (
-            project_root / "inv" / "good"
+            project_root / "corpus" / "invoices" / "good"
             / "INV-2026-05020_id-973756_aid-430394_Customer_Invoice-20260429_150716_0002.jpg"
         )
         if not sample.exists():

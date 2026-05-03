@@ -1,6 +1,6 @@
 """End-to-end Pipeline tests against the live harness.
 
-Reads `inv/good/INV-2026-05000_*.jpg` (the harness has matching invoices),
+Reads `corpus/invoices/good/INV-2026-05000_*.jpg` (the harness has matching invoices),
 classifies → OCRs → Odoo lookup → cleaned attach → archive → ledger record.
 """
 
@@ -93,7 +93,7 @@ def harness_inbox(tmp_path: Path, project_root: Path) -> Path:
     """A tmp inbox with one real invoice copied in (matching harness records)."""
     if not (HARNESS_LOGIN and HARNESS_PASSWORD):
         pytest.skip(SKIP_REASON)
-    src = project_root / "inv" / "good"
+    src = project_root / "corpus" / "invoices" / "good"
     candidate = next(
         (p for p in sorted(src.glob("INV-2026-05000_*.jpg"))),
         None,
@@ -159,7 +159,7 @@ class TestPipelineE2E:
         # Use a different invoice than the harness fixture's primary file
         # so the ledger doesn't dedupe.
         src = next(
-            (project_root / "inv" / "good").glob("INV-2026-05002_*.jpg")
+            (project_root / "corpus" / "invoices" / "good").glob("INV-2026-05002_*.jpg")
         )
         bgr = cv2.imread(str(src))
         # Rotate 180° on disk so the daemon's input is sideways.

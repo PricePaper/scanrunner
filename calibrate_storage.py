@@ -15,7 +15,7 @@
 """One-shot calibration sweep for the storage encoder.
 
 Runs the cleanup pipeline (YellowRemover → BackgroundFlattener →
-BackgroundSnapper → EdgeCleaner) on every JPEG in ``inv/good/``, then
+BackgroundSnapper → EdgeCleaner) on every JPEG in ``corpus/invoices/good/``, then
 encodes each result under a sweep of candidate settings and reports
 output bytes, background uniformity, and edge-halo per setting.
 

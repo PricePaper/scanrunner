@@ -13,8 +13,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest
 
-INV_GOOD = PROJECT_ROOT / "inv" / "good"
-INV_UNREADABLE = PROJECT_ROOT / "inv" / "unreadable"
+INV_GOOD = PROJECT_ROOT / "corpus" / "invoices" / "good"
+INV_UNREADABLE = PROJECT_ROOT / "corpus" / "invoices" / "unreadable"
+RECEIPTS = PROJECT_ROOT / "corpus" / "receipts"
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -61,3 +62,18 @@ def unreadable_paths() -> list[Path]:
     if not paths:
         pytest.skip(f"No unreadable samples in {INV_UNREADABLE}")
     return paths
+
+
+@pytest.fixture(scope="session")
+def receipt_paths() -> list[Path]:
+    """White-paper receipts (PDFs). Use these whenever a test needs
+    'paper-on-white' content vs. the yellow-paper invoices."""
+    paths = sorted(RECEIPTS.glob("*.pdf"))
+    if not paths:
+        pytest.skip(f"No receipt samples in {RECEIPTS}")
+    return paths
+
+
+@pytest.fixture(scope="session")
+def first_receipt(receipt_paths: list[Path]) -> Path:
+    return receipt_paths[0]

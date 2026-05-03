@@ -1,13 +1,13 @@
 """Population-level recovery test for the v1-failed corpus.
 
 Asserts that the v2 OCR cascade (full-page region + alt PSMs + rotation)
-recovers ≥ 70 of the files in `inv/unreadable/` that v1 could not read.
+recovers ≥ 70 of the files in `corpus/invoices/unreadable/` that v1 could not read.
 Slow (~40 s); marked `slow` so the default `pytest tests/` skips it.
 Run with `pytest -m slow` to include it.
 
 Floor of 70 derived from the actual corpus:
   * Original 99-file population: baseline (v2) was 43 / 99.
-  * User curated 8 obvious-junk files into `inv/unreadable/junk/`,
+  * User curated 8 obvious-junk files into `corpus/invoices/unreadable/junk/`,
     leaving 91 in the main directory.
   * v2 cascade recovers 73 / 91 = 80% of the remaining corpus.
   * Floor of 70 catches a regression of more than ~4 files without
@@ -66,11 +66,11 @@ def _try_one(path_str: str) -> tuple[str, str | None, int]:
 
 
 def test_v2_recovers_at_least_70_of_unreadable(project_root: Path) -> None:
-    unreadable_dir = project_root / "inv" / "unreadable"
+    unreadable_dir = project_root / "corpus" / "invoices" / "unreadable"
     paths = sorted(p for p in unreadable_dir.glob("*.png") if p.is_file())
     if len(paths) < 80:
         pytest.skip(
-            f"inv/unreadable/ has {len(paths)} files; recovery floor "
+            f"corpus/invoices/unreadable/ has {len(paths)} files; recovery floor "
             "was derived against the ~91-file curated corpus"
         )
 
@@ -84,7 +84,7 @@ def test_v2_recovers_at_least_70_of_unreadable(project_root: Path) -> None:
             if matched is not None:
                 hits.append((name, matched, rotation))
 
-    print(f"\nRecovered {len(hits)}/{len(paths)} from inv/unreadable/")
+    print(f"\nRecovered {len(hits)}/{len(paths)} from corpus/invoices/unreadable/")
     if hits:
         rotated = [h for h in hits if h[2] != 0]
         print(f"  {len(rotated)} required rotation")
