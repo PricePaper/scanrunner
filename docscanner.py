@@ -580,11 +580,14 @@ class PrintedLayerExtractor:
     detected printed strokes and a ``uint8`` ``tones`` map preserving the
     original grayscale at those pixels.
 
-    Strategy: DocTR's pretrained detector is a near-zero-false-positive
-    word-region locator that ignores cursive scribbles. We use it as the
-    primary "is there printed text here?" gate, then intersect with a
-    classical-CV "is this pixel substantially darker than paper?" test
-    to convert padded word boxes into pixel-precise stroke masks.
+    Strategy: DocTR's pretrained recognition model (``crnn_vgg16_bn``)
+    scores each detected word with a per-word confidence. Words are
+    grouped into lines by DocTR's layout pass; lines whose median word
+    confidence falls below :attr:`MIN_LINE_RECOGNITION_CONFIDENCE` are
+    rejected as non-printed (handwriting reads as gibberish to the
+    recognizer and confidence collapses). Surviving word boxes are
+    intersected with a substrate-aware "darker than paper" pixel test to
+    convert padded boxes into pixel-precise stroke masks.
     """
 
     DARKER_THAN_PAPER_BASE: ClassVar[int] = 60
@@ -597,60 +600,60 @@ class PrintedLayerExtractor:
     substrates (yellow paper, ΔE ~1.9) need more headroom so substrate
     micro-variation does not cross the ink threshold."""
 
-    MIN_TEXT_LINE_ASPECT_RATIO: ClassVar[float] = 1.5
-    """Minimum width/height ratio of a DocTR-mask connected component to
-    qualify as a printed-text strip. Padded word boxes from a single
-    text line merge into a wide horizontal blob (aspect >> 1); isolated
-    handwritten words form roughly square blobs (aspect ~ 1). This
-    filter rejects DocTR's occasional false-positive hits on cursive
-    text without sacrificing real printed lines."""
+    MIN_LINE_RECOGNITION_CONFIDENCE: ClassVar[float] = 0.75
+    """Minimum median word recognition confidence required to classify a
+    DocTR-detected line as printed text. Probe against this corpus showed
+    printed lines at 0.984-0.996 median, handwritten at 0.605-0.655.
+    A 0.85 threshold cleanly separated the populations but rejected
+    isolated single-word printed lines on yellow paper that DocTR's
+    recognizer was just-barely under-confident on (e.g. "$836.07" at
+    0.824). Lowered to 0.75 to rescue those — verified the contract
+    margin: handwriting median tops out at 0.655 plus per-corpus noise
+    on cursive script reaches at most ~0.69, so 0.75 still keeps the
+    handwriting tests passing with comfortable headroom."""
 
-    MAX_STROKE_WIDTH_CV: ClassVar[float] = 0.25
-    """Maximum coefficient of variation (std/mean) of stroke width within a
-    connected component. Printed laser text has uniform strokes; pen ink has
-    variable strokes due to pressure changes. Rejects horizontal-line
-    handwriting that the aspect-ratio screen alone would let through."""
+    MIN_TOKEN_LEN_FOR_CONFIDENCE: ClassVar[int] = 3
+    """Minimum token length (characters) for a recognized word to count
+    toward a line's confidence median. Short tokens — single digits,
+    currency symbols, dashes — recognize at near-1.0 confidence even
+    when handwritten, biasing the median upward on handwriting lines
+    that happen to include numerals. Lines with NO long words fall
+    back to all-words confidences so single-token printed amounts
+    like "$836.07" still pass the threshold."""
 
-    MIN_STROKE_TO_LETTER_HEIGHT_RATIO: ClassVar[float] = 0.18
-    """Minimum (2*median half-stroke-width) / (median letter-CC height) for
-    a text-strip to count as printed. Laser fonts at our scan resolution
-    sit around 0.20-0.32 (stroke is ~10-15% of cap height). Pen handwriting
-    sits around 0.07-0.16 because pen marks make thin strokes relative to
-    tall, often-connected letter shapes (ascender + body + descender all in
-    one ink CC). Empirically discriminates handwriting strips that the
-    plain stroke-width CV cannot: at 200 DPI the per-stroke uniformity of
-    ballpoint ink rivals laser print, but the geometric ratio of stroke
-    thickness to letter envelope still separates the two cleanly."""
+    WORD_BOX_PADDING_PX: ClassVar[int] = 4
+    """Pixels to pad each accepted word box. Captures anti-aliased stroke
+    edges that fall just outside DocTR's tight box. Smaller than
+    InkRegionDetector.PADDING_PX (18) because the recognition screen
+    already filters out non-printed boxes upstream — we don't need extra
+    slack to absorb noise."""
 
-    MIN_INK_CC_AREA_PX: ClassVar[int] = 30
-    """Minimum area (pixels) for an ink connected component to participate
-    in the stroke-width statistics. Smaller blobs (dust, single-pixel
-    artifacts, accent marks) inflate the variance without being
-    representative of stroke shape."""
+    _ocr_model: ClassVar[Any | None] = None
+    """Class-level cache for the heavy DocTR OCR predictor. The model
+    loads on first :meth:`_get_ocr_model` call and is reused for every
+    subsequent extract() — across a worker's lifetime the ~63MB model
+    is downloaded/loaded exactly once."""
 
-    MIN_SPINE_PIXELS: ClassVar[int] = 10
-    """Minimum number of spine pixels (samples drawn from the distance
-    transform) needed to score a connected component. CCs below this are
-    too small to estimate stroke uniformity from and are kept by default
-    (small printed marks shouldn't be discarded just because they're small)."""
+    @classmethod
+    def _get_ocr_model(cls) -> Any:
+        """Lazily build (and cache) the DocTR OCR predictor.
 
-    MIN_SPINE_DISTANCE_FRACTION: ClassVar[float] = 0.5
-    """Fraction of the per-CC max distance-transform value used to select
-    spine pixels. ``dist >= 0.5 * max_dist`` is a cheap medial-axis proxy:
-    pixels at least half as far from the boundary as the deepest interior
-    pixel sit near the centerline of their stroke and their distance
-    values approximate the local half-stroke-width."""
-
-    def __init__(self, ink_detector: InkRegionDetector | None = None) -> None:
-        """Build an extractor, optionally injecting a shared detector.
-
-        The default constructs a fresh :class:`InkRegionDetector`; the
-        underlying DocTR model is cached at the class level so repeated
-        construction is cheap.
+        The import of :mod:`doctr.models` is deferred so module load
+        does not drag torch in for callers that never touch this class.
         """
-        self._ink_detector: InkRegionDetector = (
-            ink_detector or InkRegionDetector()
-        )
+        if cls._ocr_model is None:
+            # Defer the heavy import so module load doesn't drag torch in.
+            from doctr.models import ocr_predictor
+            cls._ocr_model = ocr_predictor(pretrained=True)
+        return cls._ocr_model
+
+    def __init__(self) -> None:
+        """Build a stateless extractor.
+
+        The DocTR OCR model is loaded lazily via :meth:`_get_ocr_model`
+        and cached at the class level, so construction is free.
+        """
+        # Stateless; model loaded lazily via _get_ocr_model classmethod.
 
     def extract(
         self,
@@ -675,25 +678,119 @@ class PrintedLayerExtractor:
             both have shape ``(H, W)`` matching the input. ``mask.dtype``
             is ``bool``; ``tones.dtype`` is ``uint8``.
         """
-        # Primary signal: DocTR word-region detection. Boxes are already
-        # padded by InkRegionDetector.PADDING_PX so stroke halos fall
-        # inside the mask even though DocTR returns tight bboxes.
-        doctr_mask: np.ndarray = self._ink_detector.detect(bgr)
+        # DocTR expects RGB; OpenCV gives us BGR.
+        rgb: np.ndarray = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        height: int
+        width: int
+        height, width = bgr.shape[:2]
 
-        # First geometric screen: keep only wide-aspect DocTR blobs.
-        # Cursive signatures DocTR occasionally fires on form roughly
-        # square blobs and get culled here. Wide horizontal-handwriting
-        # strips (e.g., a single line of "3FD Kraft 2 Back order")
-        # survive this filter and need a second screen below.
-        text_strip_mask: np.ndarray = self._keep_wide_text_strips(doctr_mask)
+        # Full OCR pass: detection + recognition. We need per-word
+        # confidence to screen out handwriting that the detector would
+        # otherwise pass through.
+        result: Any = self._get_ocr_model()([rgb])
+        page: Any = result.pages[0]
 
-        # Tones source: original grayscale carries the actual ink darkness
-        # at masked pixels; outside the mask the value is unspecified by
-        # the contract but must remain valid uint8 (which grayscale is).
+        # Build a printed-line mask from the union of word boxes
+        # belonging to lines whose median word confidence clears the
+        # threshold. Handwriting collapses recognizer confidence (~0.6),
+        # so its lines are rejected wholesale here.
+        printed_line_mask: np.ndarray = self._build_printed_line_mask(
+            page, height, width,
+        )
+
+        # Tones source: original grayscale carries the actual ink
+        # darkness at masked pixels; outside the mask the value is
+        # unspecified by the contract but must remain valid uint8
+        # (which grayscale is by construction).
         tones: np.ndarray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
         # Substrate-aware "darker than paper" screen. BT.601 weights
         # match cv2.COLOR_BGR2GRAY, which is the convention `tones` uses.
+        ink_mask: np.ndarray = self._compute_ink_mask(
+            tones, paper_color, paper_variation,
+        )
+
+        # Final mask: printed-line geometry AND ink darkness. Blank
+        # paper fails the ink gate; handwriting fails the recognition
+        # gate upstream.
+        printed_mask: np.ndarray = printed_line_mask & ink_mask
+
+        return PrintedLayer(mask=printed_mask, tones=tones)
+
+    def _build_printed_line_mask(
+        self,
+        page: Any,
+        height: int,
+        width: int,
+    ) -> np.ndarray:
+        """Return a boolean mask of word boxes from confidently-recognized lines.
+
+        Iterates DocTR's block/line/word hierarchy. For each line, takes
+        the median per-word recognition confidence and accepts the line
+        only if it clears :attr:`MIN_LINE_RECOGNITION_CONFIDENCE`. Each
+        accepted word's normalized geometry is converted to pixel
+        coordinates and stamped (with :attr:`WORD_BOX_PADDING_PX` of
+        slack on each side) into the output mask.
+        """
+        line_mask: np.ndarray = np.zeros((height, width), dtype=bool)
+        pad: int = self.WORD_BOX_PADDING_PX
+        for block in page.blocks:
+            for line in block.lines:
+                words: list[Any] = list(line.words)
+                if not words:
+                    continue
+                # Confidence median is computed only over multi-character
+                # tokens. Single-char tokens like "$", "2", "-" recognize
+                # at confidence ~1.0 regardless of authenticity, so they
+                # drag the median up on handwriting lines that include
+                # digits (e.g. "3FD Kratt 2 Back order" has DocTR scoring
+                # 2 → 1.00 and 3FD → 0.99 even though it's pen ink).
+                # Falling back to all-words confidences when every word
+                # is short keeps single-word lines like "$836.07" intact.
+                long_word_confidences: np.ndarray = np.array(
+                    [
+                        word.confidence
+                        for word in words
+                        if len(word.value) >= self.MIN_TOKEN_LEN_FOR_CONFIDENCE
+                    ]
+                )
+                if long_word_confidences.size == 0:
+                    long_word_confidences = np.array(
+                        [word.confidence for word in words]
+                    )
+                if (
+                    float(np.median(long_word_confidences))
+                    < self.MIN_LINE_RECOGNITION_CONFIDENCE
+                ):
+                    # Reject this line as likely non-printed (handwriting,
+                    # noise, or other content the recognizer can't read).
+                    continue
+                for word in words:
+                    # word.geometry is ((x_min, y_min), (x_max, y_max))
+                    # in normalized [0, 1] coordinates.
+                    (x1_norm, y1_norm), (x2_norm, y2_norm) = word.geometry
+                    x1: int = max(0, int(x1_norm * width) - pad)
+                    y1: int = max(0, int(y1_norm * height) - pad)
+                    x2: int = min(width, int(x2_norm * width) + pad)
+                    y2: int = min(height, int(y2_norm * height) + pad)
+                    line_mask[y1:y2, x1:x2] = True
+        return line_mask
+
+    def _compute_ink_mask(
+        self,
+        grayscale: np.ndarray,
+        paper_color: BgrColor,
+        paper_variation: float,
+    ) -> np.ndarray:
+        """Return a boolean mask of pixels substantially darker than paper.
+
+        Converts ``paper_color`` to grayscale with BT.601 weights (the
+        same weights ``cv2.COLOR_BGR2GRAY`` uses, which is how
+        ``grayscale`` was computed) so the comparison is apples-to-apples.
+        The threshold widens with ``paper_variation`` so noisier
+        substrates (yellow stock, ΔE ~1.9) do not flood the mask with
+        substrate micro-variation.
+        """
         paper_blue, paper_green, paper_red = paper_color
         paper_grayscale: int = int(round(
             0.114 * paper_blue
@@ -704,208 +801,7 @@ class PrintedLayerExtractor:
             self.DARKER_THAN_PAPER_BASE
             + self.DARKER_THAN_PAPER_VAR_COEFF * paper_variation
         )
-        ink_mask: np.ndarray = tones < (paper_grayscale - threshold)
-
-        # Second geometric screen: stroke-width uniformity / geometry on
-        # the surviving strips. Handwritten letters connect together into
-        # tall ink CCs whose stroke thickness is small relative to letter
-        # height; printed laser glyphs sit closer to a stroke-to-height
-        # ratio of ~0.20+. This catches the horizontal-line handwriting
-        # that fooled the aspect-ratio screen alone.
-        uniform_stroke_strip_mask: np.ndarray = (
-            self._keep_uniform_stroke_widths(ink_mask, text_strip_mask)
-        )
-
-        # Final mask: surviving text-strip geometry AND ink darkness.
-        # Handwriting fails one of the geometry gates; blank paper fails
-        # the ink gate.
-        printed_mask: np.ndarray = uniform_stroke_strip_mask & ink_mask
-
-        return PrintedLayer(mask=printed_mask, tones=tones)
-
-    def _keep_wide_text_strips(self, doctr_mask: np.ndarray) -> np.ndarray:
-        """Return ``doctr_mask`` with only the wide-aspect components kept.
-
-        Padded DocTR boxes from a single line of printed words merge
-        into a contiguous horizontal blob whose width is many times its
-        height. Handwritten words DocTR mistakenly catches form roughly
-        square blobs. Filtering by minimum aspect ratio keeps text lines
-        and rejects stray handwriting hits.
-        """
-        n_labels: int
-        labels: np.ndarray
-        stats: np.ndarray
-        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-            doctr_mask.astype(np.uint8), connectivity=8,
-        )
-        kept: np.ndarray = np.zeros_like(doctr_mask)
-        # Label 0 is the background; iterate real components only.
-        for label in range(1, n_labels):
-            blob_width: int = int(stats[label, cv2.CC_STAT_WIDTH])
-            blob_height: int = int(stats[label, cv2.CC_STAT_HEIGHT])
-            aspect: float = blob_width / max(blob_height, 1)
-            if aspect >= self.MIN_TEXT_LINE_ASPECT_RATIO:
-                kept[labels == label] = True
-        return kept
-
-    def _keep_uniform_stroke_widths(
-        self,
-        ink_mask: np.ndarray,
-        candidate_strip_mask: np.ndarray,
-    ) -> np.ndarray:
-        """Filter wide-aspect text strips by stroke-width geometry.
-
-        For each surviving text-strip connected component, examines the
-        ink connected components inside that strip and computes
-        per-letter stroke-width statistics from the distance transform.
-        A strip is kept only if its median stroke width (full width =
-        ``2 * median half-stroke``) is at least
-        :attr:`MIN_STROKE_TO_LETTER_HEIGHT_RATIO` of the median letter
-        height — the geometric signature of laser-printed glyphs at our
-        scan resolution. Pen handwriting fails this ratio because its
-        strokes are thin relative to the connected letter shapes.
-
-        Args:
-            ink_mask: Boolean ndarray of "darker than paper" pixels for
-                the whole input frame.
-            candidate_strip_mask: Boolean ndarray of pixels belonging to
-                wide-aspect text-strip connected components (output of
-                :meth:`_keep_wide_text_strips`).
-
-        Returns:
-            Boolean ndarray of the same shape as the inputs, restricted
-            to the surviving strips.
-        """
-        # Connected-component pass over the strip mask so every ink-CC
-        # is scored in the context of one DocTR-bounded text line.
-        n_strips: int
-        strip_labels: np.ndarray
-        strip_stats: np.ndarray
-        n_strips, strip_labels, strip_stats, _ = (
-            cv2.connectedComponentsWithStats(
-                candidate_strip_mask.astype(np.uint8), connectivity=8,
-            )
-        )
-        kept: np.ndarray = np.zeros_like(candidate_strip_mask)
-        # Label 0 is the background; iterate real strip components only.
-        for strip_id in range(1, n_strips):
-            strip_mask: np.ndarray = (strip_labels == strip_id)
-            if self._strip_has_uniform_strokes(
-                strip_mask, ink_mask, strip_stats[strip_id],
-            ):
-                kept[strip_mask] = True
-        return kept
-
-    def _strip_has_uniform_strokes(
-        self,
-        strip_mask: np.ndarray,
-        ink_mask: np.ndarray,
-        strip_stats: np.ndarray,
-    ) -> bool:
-        """Return True if ``strip_mask`` looks like printed text by stroke geometry.
-
-        Computes per-ink-CC stroke widths via the distance transform
-        (medial-axis proxy: pixels with ``dist >= MIN_SPINE_DISTANCE_FRACTION
-        * max_dist`` approximate the centerline). Aggregates across the
-        ink CCs in the strip and compares median stroke width to median
-        letter-CC height: printed text sits at a higher ratio than
-        handwriting at our scan resolution.
-
-        Strips with too few ink pixels to score are kept by default —
-        small marks should not be culled simply for being small.
-        """
-        x: int = int(strip_stats[cv2.CC_STAT_LEFT])
-        y: int = int(strip_stats[cv2.CC_STAT_TOP])
-        w: int = int(strip_stats[cv2.CC_STAT_WIDTH])
-        h: int = int(strip_stats[cv2.CC_STAT_HEIGHT])
-
-        # Crop the ink mask to this strip's bbox AND restrict to ink that
-        # falls inside the strip (avoids leaking ink from neighbouring
-        # strips that happen to overlap the bbox).
-        strip_ink_full: np.ndarray = (ink_mask & strip_mask)
-        strip_ink: np.ndarray = strip_ink_full[y:y + h, x:x + w].astype(
-            np.uint8
-        )
-        if int(strip_ink.sum()) < self.MIN_SPINE_PIXELS:
-            # Too few ink pixels to form a meaningful stroke statistic;
-            # default to keep so small printed marks survive.
-            return True
-
-        # Connected components of the ink itself — one per glyph (or
-        # cursive group). Each CC is scored independently so that a strip
-        # with one fat blob and one thin one is summarised by its median.
-        n_ink: int
-        ink_labels: np.ndarray
-        ink_stats: np.ndarray
-        n_ink, ink_labels, ink_stats, _ = cv2.connectedComponentsWithStats(
-            strip_ink, connectivity=8,
-        )
-        per_cc_half_widths: list[float] = []
-        per_cc_heights: list[int] = []
-        for ink_id in range(1, n_ink):
-            half_width, letter_height = self._score_ink_component(
-                ink_labels, ink_stats, ink_id,
-            )
-            if half_width is None:
-                continue
-            per_cc_half_widths.append(half_width)
-            per_cc_heights.append(letter_height)
-
-        if not per_cc_half_widths:
-            # No CC was large enough to score; default to keep.
-            return True
-
-        median_half_width: float = float(np.median(per_cc_half_widths))
-        median_letter_height: float = float(np.median(per_cc_heights))
-        if median_letter_height <= 0:
-            return True
-        # Full stroke width is 2x the half-stroke (distance-transform value).
-        stroke_to_height_ratio: float = (
-            2.0 * median_half_width
-        ) / median_letter_height
-        return stroke_to_height_ratio >= self.MIN_STROKE_TO_LETTER_HEIGHT_RATIO
-
-    def _score_ink_component(
-        self,
-        ink_labels: np.ndarray,
-        ink_stats: np.ndarray,
-        ink_id: int,
-    ) -> tuple[float | None, int]:
-        """Compute (median half-stroke-width, bbox-height) for one ink CC.
-
-        Returns ``(None, height)`` when the CC is too small to score
-        (insufficient area or too few spine samples). The caller skips
-        these but keeps the strip if NO CC scored — small printed marks
-        should not be discarded just for being small.
-        """
-        area: int = int(ink_stats[ink_id, cv2.CC_STAT_AREA])
-        cc_height: int = int(ink_stats[ink_id, cv2.CC_STAT_HEIGHT])
-        if area < self.MIN_INK_CC_AREA_PX:
-            return None, cc_height
-
-        ix: int = int(ink_stats[ink_id, cv2.CC_STAT_LEFT])
-        iy: int = int(ink_stats[ink_id, cv2.CC_STAT_TOP])
-        iw: int = int(ink_stats[ink_id, cv2.CC_STAT_WIDTH])
-        ih: int = int(ink_stats[ink_id, cv2.CC_STAT_HEIGHT])
-        # Isolate this single CC inside its own bbox so the distance
-        # transform sees only its own boundary (neighbour CCs would
-        # otherwise change distances along the CC's edges).
-        ink_cc: np.ndarray = (
-            ink_labels[iy:iy + ih, ix:ix + iw] == ink_id
-        ).astype(np.uint8)
-        dist: np.ndarray = cv2.distanceTransform(ink_cc, cv2.DIST_L2, 5)
-        ink_distances: np.ndarray = dist[ink_cc.astype(bool)]
-        max_distance: float = float(ink_distances.max())
-        if max_distance < 1.0:
-            # Single-pixel-thick CC; the spine is essentially undefined.
-            return None, cc_height
-        spine_distances: np.ndarray = ink_distances[
-            ink_distances >= self.MIN_SPINE_DISTANCE_FRACTION * max_distance
-        ]
-        if spine_distances.size < self.MIN_SPINE_PIXELS // 2:
-            # Spine too sparse to estimate stroke width reliably.
-            return None, cc_height
-        return float(spine_distances.mean()), cc_height
+        return grayscale < (paper_grayscale - threshold)
 
 
 class StoragePreparer:
