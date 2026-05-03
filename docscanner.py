@@ -1013,10 +1013,17 @@ class DocumentDecomposer:
 
 
 class StoragePreparer:
-    """Compose the storage pipeline: downsample → flatten → snap → clean → encode.
+    """v3 storage pipeline: decompose → composite → downsample → encode.
 
-    Takes a (yellow-removed if applicable) BGR image and returns the bytes
-    to upload to Odoo, plus the resulting MIME type.
+    Takes a raw BGR scan, runs the v3 layered decomposition (paper /
+    printed / handwritten), composites the two ink layers onto a clean
+    white canvas, downsamples to TARGET_DPI, and encodes for Odoo.
+
+    The substrate-aware decomposer handles yellow paper natively via
+    estimate_paper_tone; no pre-cleanup pass (YellowRemover etc.) is
+    needed here. Callers should pass the ORIGINAL scan, not a
+    yellow-removed version — pre-cleanup damages faint pen ink that
+    the decomposer would otherwise preserve in the handwritten layer.
     """
 
     SOURCE_DPI: ClassVar[int] = 300
@@ -1025,59 +1032,28 @@ class StoragePreparer:
 
     def __init__(
         self,
-        flattener: BackgroundFlattener | None = None,
-        snapper: BackgroundSnapper | None = None,
-        rescuer: FaintInkRescuer | None = None,
-        edge_cleaner: EdgeCleaner | None = None,
-        edge_crispener: EdgeCrispener | None = None,
-        quantizer: ForegroundQuantizer | None = None,
-        ink_detector: InkRegionDetector | None = None,
+        decomposer: DocumentDecomposer | None = None,
         encoder: Encoder | None = None,
     ) -> None:
-        self._flattener = flattener or BackgroundFlattener()
-        self._snapper = snapper or BackgroundSnapper()
-        self._rescuer = rescuer or FaintInkRescuer()
-        self._edge_cleaner = edge_cleaner or EdgeCleaner()
-        self._edge_crispener = edge_crispener or EdgeCrispener()
-        self._quantizer = quantizer or ForegroundQuantizer()
-        self._ink_detector = ink_detector or InkRegionDetector()
+        self._decomposer = decomposer or DocumentDecomposer()
         self._encoder = encoder or Encoder()
 
-    def prepare(self, cleaned: BgrImage | GrayImage) -> tuple[bytes, str]:
-        # DocTR ink-region detection runs on the full-resolution cleaned
-        # image (the detector benefits from the extra detail). The
-        # resulting mask is downsampled with the image so it stays
-        # aligned with the snapped output.
-        if cleaned.ndim == 2:
-            ink_input: BgrImage = cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR)
-        else:
-            ink_input = cleaned
-        ink_mask_full: np.ndarray = self._ink_detector.detect(ink_input)
-        new_w: int = int(cleaned.shape[1] * self.DOWNSAMPLE)
-        new_h: int = int(cleaned.shape[0] * self.DOWNSAMPLE)
-        scaled: BgrImage | GrayImage = cv2.resize(
-            cleaned, (new_w, new_h), interpolation=cv2.INTER_AREA
+    def prepare(self, bgr: BgrImage) -> tuple[bytes, str]:
+        # Decompose at full source resolution: DocTR's recognition is
+        # more accurate on detailed input, and the substrate-aware ink
+        # decisions benefit from access to original pixel values.
+        document: Document = self._decomposer.decompose(bgr)
+        composite: np.ndarray = document.composite()
+        # Downsample to TARGET_DPI for storage. INTER_AREA is the
+        # right interpolation for shrink ops — it averages source
+        # pixels rather than sampling, preserving the printed/
+        # handwritten tones the layers carried through.
+        new_w: int = int(composite.shape[1] * self.DOWNSAMPLE)
+        new_h: int = int(composite.shape[0] * self.DOWNSAMPLE)
+        downsampled: np.ndarray = cv2.resize(
+            composite, (new_w, new_h), interpolation=cv2.INTER_AREA,
         )
-        ink_mask: np.ndarray = cv2.resize(
-            ink_mask_full.astype(np.uint8), (new_w, new_h),
-            interpolation=cv2.INTER_NEAREST,
-        ).astype(bool)
-        flat: BgrImage | GrayImage = self._flattener.flatten(scaled)
-        snapped: GrayImage
-        fg_mask: GrayImage
-        snapped, fg_mask = self._snapper.snap(flat)
-        snapped, fg_mask = self._rescuer.rescue(snapped, fg_mask, flat)
-        snapped = self._edge_cleaner.clean(snapped, fg_mask)
-        # Final precision filter: anything outside the detected ink
-        # regions is paper noise. Force-snap to white.
-        snapped[~ink_mask] = 255
-        # Compaction primitives (EdgeCrispener, ForegroundQuantizer) are
-        # implemented but NOT wired into the production chain. Both were
-        # tried and both damaged faint handwriting / printed text in
-        # ways the office found unacceptable. They remain available as
-        # building blocks if a future change wants them under different
-        # parameters.
-        return self._encoder.encode(snapped)
+        return self._encoder.encode(downsampled)
 
 
 # -----------------------------------------------------------------------------
@@ -2172,7 +2148,7 @@ class Pipeline:
             regex=doc_type.regex,
         )
         if result is None:
-            self._handle_failure(source, digest, "OCR did not match regex", cleaned=cleaned)
+            self._handle_failure(source, digest, "OCR did not match regex", bgr=bgr)
             return ProcessOutcome(
                 source, False, None, None, None, None, None, "OCR miss"
             )
@@ -2183,8 +2159,10 @@ class Pipeline:
                 ocr.name, source.name, result.rotation_degrees,
             )
             # Keep storage / archive in the orientation that OCR succeeded
-            # at — the office reviewer never sees a sideways scan.
-            cleaned = np.rot90(cleaned, k=result.rotation_degrees // 90)
+            # at — the office reviewer never sees a sideways scan. Rotate
+            # the ORIGINAL bgr (not the OCR-preprocessed cleaned), since
+            # v3 storage operates on the original via the layered model.
+            bgr = np.rot90(bgr, k=result.rotation_degrees // 90)
         else:
             self._log.info("OCR extracted %s from %s", ocr.name, source.name)
 
@@ -2194,17 +2172,21 @@ class Pipeline:
         )
         if odoo_id is None:
             self._handle_failure(
-                source, digest, f"no Odoo record for {ocr.name}", cleaned=cleaned,
+                source, digest, f"no Odoo record for {ocr.name}", bgr=bgr,
             )
             return ProcessOutcome(
                 source, False, ocr.name, None, None, None, ocr.region,
                 "Odoo record not found",
             )
 
-        # 5. Storage prep — uses the rotation-corrected `cleaned` array.
+        # 5. Storage prep — v3 layered decomposer runs against the
+        # rotation-corrected ORIGINAL bgr (not the OCR-cleaned version).
+        # The substrate-aware extractors handle yellow paper natively;
+        # pre-cleanup would damage faint pen ink that the handwriting
+        # extractor would otherwise preserve.
         payload: bytes
         mime: str
-        payload, mime = self._storage_preparer.prepare(cleaned)
+        payload, mime = self._storage_preparer.prepare(bgr)
 
         # 6. Odoo attach + link
         attachment_id: int = self._odoo.attach(
@@ -2255,28 +2237,29 @@ class Pipeline:
         digest: str,
         error: str,
         *,
-        cleaned: BgrImage | None = None,
+        bgr: BgrImage | None = None,
     ) -> None:
         """Route a failed file into ``done/unreadable/`` and (optionally) email.
 
-        If ``cleaned`` is supplied (we got far enough to preprocess the
-        image — OCR miss, Odoo miss), we encode it once via
-        ``StoragePreparer`` and use those bytes for BOTH the unreadable
+        If ``bgr`` is supplied (we got far enough into the pipeline that
+        the original image is in memory — OCR miss, Odoo miss), we encode
+        it once via ``StoragePreparer`` (which runs the full v3 layered
+        decomposition) and use those bytes for BOTH the unreadable
         archive and the email attachment. The reviewer sees the same
-        readable, yellow-stripped, rotation-corrected image the office
-        would have got on success.
+        clean, rotation-corrected image the office would have got on
+        success.
 
-        If ``cleaned`` is None (no DocumentType matched, cv2 couldn't
-        read the file, generic exception), we fall back to the raw
-        original bytes with a magic-sniffed MIME.
+        If ``bgr`` is None (no DocumentType matched, cv2 couldn't read
+        the file, generic exception), we fall back to the raw original
+        bytes with a magic-sniffed MIME.
         """
         self._log.error("FAIL %s: %s", source.name, error)
 
         payload: bytes | None = None
         mime: str = "application/octet-stream"
         ext: str = ""
-        if cleaned is not None:
-            payload, mime = self._storage_preparer.prepare(cleaned)
+        if bgr is not None:
+            payload, mime = self._storage_preparer.prepare(bgr)
             ext = "jpg" if mime == "image/jpeg" else "png"
 
         # Snapshot raw bytes BEFORE the move, used as fallback.

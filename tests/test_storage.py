@@ -1,8 +1,12 @@
-"""Contract tests for StoragePreparer and Encoder.
+"""Contract tests for StoragePreparer and Encoder (v3 layered pipeline).
 
 These verify the production reproduction guarantee end-to-end on real
-corpus/invoices/good/ samples: pure-white background, faithful foreground, fixed
-calibrated encoder settings, JPEG≤300KB-or-PNG-fallback rule.
+corpus/invoices/good/ samples: pure-white background, faithful foreground,
+fixed calibrated encoder settings, JPEG≤300KB-or-PNG-fallback rule.
+
+StoragePreparer in v3 takes the ORIGINAL bgr scan (no YellowRemover
+preprocessing); the substrate-aware DocumentDecomposer handles yellow
+paper natively via estimate_paper_tone.
 """
 
 from pathlib import Path
@@ -12,12 +16,8 @@ import numpy as np
 import pytest
 
 from docscanner import (
-    BackgroundFlattener,
-    BackgroundSnapper,
-    EdgeCleaner,
     Encoder,
     StoragePreparer,
-    YellowRemover,
 )
 
 
@@ -70,8 +70,7 @@ class TestStoragePreparer:
         self, first_good_invoice: Path
     ) -> None:
         bgr = cv2.imread(str(first_good_invoice))
-        cleaned = YellowRemover().remove(bgr)
-        payload, mime = StoragePreparer().prepare(cleaned)
+        payload, mime = StoragePreparer().prepare(bgr)
         assert mime in {"image/jpeg", "image/png"}
         assert len(payload) > 0
 
@@ -79,8 +78,7 @@ class TestStoragePreparer:
         self, first_good_invoice: Path
     ) -> None:
         bgr = cv2.imread(str(first_good_invoice))
-        cleaned = YellowRemover().remove(bgr)
-        payload, mime = StoragePreparer().prepare(cleaned)
+        payload, mime = StoragePreparer().prepare(bgr)
         if mime == "image/jpeg":
             assert len(payload) <= 300_000, (
                 f"JPEG payload {len(payload)} bytes exceeds 300 KB cap"
@@ -89,22 +87,17 @@ class TestStoragePreparer:
     def test_decoded_storage_image_is_majority_pure_white(
         self, first_good_invoice: Path
     ) -> None:
-        """The reproduction contract, restated against the actual pixel
-        population: the OVERWHELMING majority of pixels in the decoded
-        output are pure 255.
+        """The reproduction contract: the OVERWHELMING majority of pixels
+        in the decoded output are pure 255.
 
-        Why not "the margin is exactly 255": scanner shadows along the
-        page edge can be picked up by FaintInkRescuer (which grows the
-        foreground mask outward by ~20 px from any detected ink), so
-        any specific row near the border is not a reliable margin
-        sample on every invoice. The page-wide majority assertion is
-        the contract that actually matters — at least 90 % pure 255
-        means the snap pipeline did its job (paper is paper) even
-        though some faint-ink pixels and scanner shadows survive.
+        v3 layered model produces an explicitly white canvas (paper is
+        not a layer; whatever printed/handwritten don't claim is rendered
+        as 255 by Document.composite()). The page-wide majority assertion
+        is the contract that actually matters — at least 85 % pure 255
+        on PNG, or ≥254 on JPEG (which can fringe ±1 grey-level).
         """
         bgr = cv2.imread(str(first_good_invoice))
-        cleaned = YellowRemover().remove(bgr)
-        payload, mime = StoragePreparer().prepare(cleaned)
+        payload, mime = StoragePreparer().prepare(bgr)
         decoded = cv2.imdecode(
             np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_GRAYSCALE
         )
@@ -112,7 +105,7 @@ class TestStoragePreparer:
         if mime == "image/png":
             assert pure_white_fraction >= 0.85, (
                 f"PNG: only {pure_white_fraction:.1%} of pixels are pure 255 "
-                "— the snap+rescue pipeline left too much foreground"
+                "— the layered composite left too much foreground"
             )
         else:
             # JPEG can fringe ±1 grey-level. Allow that into the count.
@@ -127,8 +120,7 @@ class TestStoragePreparer:
         self, first_good_invoice: Path
     ) -> None:
         bgr = cv2.imread(str(first_good_invoice))
-        cleaned = YellowRemover().remove(bgr)
-        payload, _ = StoragePreparer().prepare(cleaned)
+        payload, _ = StoragePreparer().prepare(bgr)
         decoded = cv2.imdecode(
             np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_GRAYSCALE
         )
@@ -144,8 +136,7 @@ class TestStoragePreparer:
     ) -> None:
         """Foreground must retain tone — not 1-bit black-or-white."""
         bgr = cv2.imread(str(first_good_invoice))
-        cleaned = YellowRemover().remove(bgr)
-        payload, _ = StoragePreparer().prepare(cleaned)
+        payload, _ = StoragePreparer().prepare(bgr)
         decoded = cv2.imdecode(
             np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_GRAYSCALE
         )
@@ -163,19 +154,22 @@ class TestStoragePreparer:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_all_samples_produce_valid_output(good_invoice_paths: list[Path]) -> None:
     """Every sample must round-trip through the storage pipeline.
+
+    Marked @slow because the v3 layered model invokes DocTR per page
+    (~5-15 s/page on CPU). Across 168 samples this is ~30 min. Run
+    explicitly with `pytest -m slow`.
 
     The cap on file size is per-format (JPEG ≤ 300 KB; PNG fallback is
     unlimited per user spec). We verify mime is one of the two and
     decode succeeds.
     """
-    yellow = YellowRemover()
     prep = StoragePreparer()
     for path in good_invoice_paths:
         bgr = cv2.imread(str(path))
-        cleaned = yellow.remove(bgr)
-        payload, mime = prep.prepare(cleaned)
+        payload, mime = prep.prepare(bgr)
         assert mime in {"image/jpeg", "image/png"}, f"{path.name}: bad mime {mime}"
         decoded = cv2.imdecode(
             np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_GRAYSCALE
