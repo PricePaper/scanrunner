@@ -602,15 +602,16 @@ class PrintedLayerExtractor:
 
     MIN_LINE_RECOGNITION_CONFIDENCE: ClassVar[float] = 0.75
     """Minimum median word recognition confidence required to classify a
-    DocTR-detected line as printed text. Probe against this corpus showed
-    printed lines at 0.984-0.996 median, handwritten at 0.605-0.655.
-    A 0.85 threshold cleanly separated the populations but rejected
-    isolated single-word printed lines on yellow paper that DocTR's
-    recognizer was just-barely under-confident on (e.g. "$836.07" at
-    0.824). Lowered to 0.75 to rescue those — verified the contract
-    margin: handwriting median tops out at 0.655 plus per-corpus noise
-    on cursive script reaches at most ~0.69, so 0.75 still keeps the
-    handwriting tests passing with comfortable headroom."""
+    DocTR-detected line as printed text. Probe against this corpus
+    showed printed lines at 0.984-0.996 median, handwritten at
+    0.605-0.655. A 0.85 threshold cleanly separates the populations
+    on white paper but rejects yellow-paper printed lines whose
+    confidence drops because of substrate-induced recognition noise
+    (e.g. "$836.07" reads at 0.824 on yellow). 0.75 keeps those
+    printed amounts intact at the cost of letting block-letter
+    handwriting whose recognized tokens skew high (e.g. "3FD Kraft
+    2 Back order") leak through. The user-validated trade: accept
+    the leak rather than lose any printed text."""
 
     MIN_TOKEN_LEN_FOR_CONFIDENCE: ClassVar[int] = 3
     """Minimum token length (characters) for a recognized word to count
