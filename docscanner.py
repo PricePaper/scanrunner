@@ -5,7 +5,6 @@
 #   "opencv-python-headless>=4.10",
 #   "Pillow>=11.0",
 #   "numpy>=2.0",
-#   "pytesseract>=0.3.13",
 #   "python-magic>=0.4.27",
 #   "PyYAML>=6.0",
 #   "watchdog>=5.0",
@@ -51,7 +50,6 @@ import cv2
 import httpx
 import magic
 import numpy as np
-import pytesseract  # type: ignore[import-untyped]
 import yaml  # type: ignore[import-untyped]
 from PIL import Image
 from watchdog.events import FileClosedEvent, FileSystemEventHandler
@@ -528,6 +526,29 @@ class Encoder:
         return buf.getvalue(), "image/png"
 
 
+# --- shared DocTR OCR predictor ----------------------------------------------
+# Both PrintedLayerExtractor (recognition-confidence screen) and OcrEngine
+# (invoice-number extraction) need the same DocTR ocr_predictor. Loading the
+# model is the expensive step (~63 MB pulled from S3 on first call, ~5 s
+# on warm cache); the inference itself is comparatively cheap. Caching at
+# module scope guarantees one load per worker process — across PrintedLayer
+# extractions and OCR cascades alike.
+_DOCTR_OCR_MODEL: Any | None = None
+
+
+def _get_doctr_ocr_model() -> Any:
+    """Lazily build (and cache) the DocTR OCR predictor.
+
+    The import of :mod:`doctr.models` is deferred so module load does
+    not drag torch in for callers that never touch the predictor.
+    """
+    global _DOCTR_OCR_MODEL
+    if _DOCTR_OCR_MODEL is None:
+        from doctr.models import ocr_predictor
+        _DOCTR_OCR_MODEL = ocr_predictor(pretrained=True)
+    return _DOCTR_OCR_MODEL
+
+
 # --- shared substrate-aware ink threshold ------------------------------------
 # Both PrintedLayerExtractor and HandwrittenLayerExtractor classify a pixel as
 # ink when its grayscale value drops more than
@@ -676,32 +697,13 @@ class PrintedLayerExtractor:
     already filters out non-printed boxes upstream — we don't need extra
     slack to absorb noise."""
 
-    _ocr_model: ClassVar[Any | None] = None
-    """Class-level cache for the heavy DocTR OCR predictor. The model
-    loads on first :meth:`_get_ocr_model` call and is reused for every
-    subsequent extract() — across a worker's lifetime the ~63MB model
-    is downloaded/loaded exactly once."""
-
-    @classmethod
-    def _get_ocr_model(cls) -> Any:
-        """Lazily build (and cache) the DocTR OCR predictor.
-
-        The import of :mod:`doctr.models` is deferred so module load
-        does not drag torch in for callers that never touch this class.
-        """
-        if cls._ocr_model is None:
-            # Defer the heavy import so module load doesn't drag torch in.
-            from doctr.models import ocr_predictor
-            cls._ocr_model = ocr_predictor(pretrained=True)
-        return cls._ocr_model
-
     def __init__(self) -> None:
         """Build a stateless extractor.
 
-        The DocTR OCR model is loaded lazily via :meth:`_get_ocr_model`
-        and cached at the class level, so construction is free.
+        The DocTR OCR model is loaded lazily via :func:`_get_doctr_ocr_model`
+        and cached at module scope, so construction is free.
         """
-        # Stateless; model loaded lazily via _get_ocr_model classmethod.
+        # Stateless; model loaded lazily via _get_doctr_ocr_model().
 
     def extract(
         self,
@@ -735,7 +737,7 @@ class PrintedLayerExtractor:
         # Full OCR pass: detection + recognition. We need per-word
         # confidence to screen out handwriting that the detector would
         # otherwise pass through.
-        result: Any = self._get_ocr_model()([rgb])
+        result: Any = _get_doctr_ocr_model()([rgb])
         page: Any = result.pages[0]
 
         # Build a printed-line mask from the union of word boxes
@@ -1157,7 +1159,6 @@ class DocumentTypeConfig:
     mime_types: tuple[str, ...]
     ocr_regex: str
     search_regions: tuple[Region, ...]
-    tesseract_config: str
     odoo_sequence: str
     odoo_object: str
     odoo_attachment_tag_id: int
@@ -1166,7 +1167,6 @@ class DocumentTypeConfig:
     # single-attempt behavior). The cascade fires only if the primary OCR
     # misses, so the fast path is unaffected.
     fallback_search_regions: tuple[tuple[Region, ...], ...] = ()
-    fallback_tesseract_configs: tuple[str, ...] = ()
     ocr_try_rotation: bool = False
 
 
@@ -1199,7 +1199,6 @@ class Config:
         self.server_name: str = server_name
         self.retry: int = int(raw.get("retry", 3))
         self.retry_sleep: float = float(raw.get("retry_sleep", 1.0))
-        self.tesseract_bin: str = raw.get("tesseract-bin", "/usr/bin/tesseract")
         self.done_path: str = raw.get("done-path", "done")
         self.error_email: str = raw.get("error-email", "")
         self.error_mail_message: str = raw.get("error-mail-message", "")
@@ -1223,7 +1222,6 @@ class Config:
                     search_regions=tuple(
                         Region.from_list(r) for r in doc["search_regions"]
                     ),
-                    tesseract_config=doc.get("tesseract_config", "--psm 6 -l eng"),
                     odoo_sequence=doc["odoo_sequence"],
                     odoo_object=doc["odoo_object"],
                     odoo_attachment_tag_id=int(doc["odoo_attachment_tag_id"]),
@@ -1231,9 +1229,6 @@ class Config:
                     fallback_search_regions=tuple(
                         tuple(Region.from_list(r) for r in region_set)
                         for region_set in doc.get("fallback_search_regions", [])
-                    ),
-                    fallback_tesseract_configs=tuple(
-                        doc.get("fallback_tesseract_configs", [])
                     ),
                     ocr_try_rotation=bool(doc.get("ocr_try_rotation", False)),
                 )
@@ -1274,36 +1269,8 @@ class Config:
 
 
 # -----------------------------------------------------------------------------
-# OCR pipeline — preparer (in-memory binary), engine (Tesseract per region).
+# OCR pipeline — DocTR detection + recognition over per-region BGR crops.
 # -----------------------------------------------------------------------------
-
-
-class OcrPreparer:
-    """Produce the throw-away binary image used for OCR.
-
-    Intentionally aggressive: the goal is glyph legibility, not preservation.
-    Used by ``OcrEngine``; its output is never written to disk.
-    """
-
-    BLOCK_SIZE: ClassVar[int] = 31
-    C: ClassVar[int] = 12
-
-    def binarize(self, img: BgrImage | GrayImage) -> GrayImage:
-        gray: GrayImage = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        clahe: cv2.CLAHE = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        gray = clahe.apply(gray)
-        gray = cv2.fastNlMeansDenoising(gray, h=10)
-        binary: GrayImage = cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            blockSize=self.BLOCK_SIZE,
-            C=self.C,
-        )
-        return cv2.morphologyEx(
-            binary, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1329,48 +1296,47 @@ class OcrResult:
 
 
 class OcrEngine:
-    """Run Tesseract on each region in priority order; first regex hit wins.
+    """Run DocTR on each region in priority order; first regex hit wins.
 
-    The two-region rule lives here. The caller (the document type) picks
-    the regions; this engine just tries them in order. ``SO…`` numbers are
-    naturally rejected by an ``R?INV``-anchored regex.
-
-    OCR output is normalized before matching: whitespace and common stray
-    punctuation are stripped, so "INV,/2026 /05000" still matches.
+    DocTR's ``ocr_predictor`` runs detection + recognition end-to-end.
+    The engine concatenates per-word ``.value`` text within each region
+    crop, normalizes whitespace and stray punctuation, and matches the
+    configured regex. Two-region priority rule lives here: the caller
+    (the document type) picks the regions; this engine tries them in
+    order. ``SO…`` numbers are naturally rejected by an ``R?INV``-
+    anchored regex.
 
     For documents that may arrive sideways or upside down or that need
-    fallback regions/PSMs, use ``extract_with_fallbacks`` — it cascades
+    fallback regions, use ``extract_with_fallbacks`` — it cascades
     through tier-by-tier and reports the rotation that worked.
+
+    Replaces the v3.4 Tesseract backend. DocTR's recognition is more
+    robust on the unreadable-corpus tail (1-bit scans, faint scanner
+    output, light skew) and avoids the per-PSM tuning the Tesseract
+    cascade needed.
     """
 
+    UPSCALE_THRESHOLD_PX: ClassVar[int] = 600
+    """Crop side length below which DocTR loses glyph detail. Crops
+    smaller than this get bicubic-upscaled to 2× before recognition."""
+
     UPSCALE_FACTOR: ClassVar[int] = 2
+
     NOISE_CHARS: ClassVar[re.Pattern[str]] = re.compile(r"[\s,.;:_|\\]")
     ROTATION_ANGLES: ClassVar[tuple[int, ...]] = (90, 180, 270)
 
-    def __init__(self, tesseract_bin: str = "/usr/bin/tesseract") -> None:
-        pytesseract.pytesseract.tesseract_cmd = tesseract_bin
-
     def extract(
         self,
-        binary: GrayImage,
+        bgr: BgrImage,
         regions: tuple[Region, ...],
         regex: re.Pattern[str],
-        tesseract_config: str,
     ) -> OcrMatch | None:
+        """Run DocTR on each ``regions`` crop in order; return the first hit."""
         for region in regions:
-            crop: GrayImage = region.crop(binary)
+            crop: BgrImage = region.crop(bgr)
             if crop.size == 0:
                 continue
-            # Upscale small crops to give Tesseract more glyph detail.
-            if min(crop.shape[:2]) < 200:
-                crop = cv2.resize(
-                    crop,
-                    None,
-                    fx=self.UPSCALE_FACTOR,
-                    fy=self.UPSCALE_FACTOR,
-                    interpolation=cv2.INTER_CUBIC,
-                )
-            text: str = pytesseract.image_to_string(crop, config=tesseract_config)
+            text: str = self._recognize(crop)
             normalized: str = self.NOISE_CHARS.sub("", text)
             match: re.Match[str] | None = regex.search(normalized)
             if match:
@@ -1379,54 +1345,64 @@ class OcrEngine:
 
     def extract_with_fallbacks(
         self,
-        binary: GrayImage,
+        bgr: BgrImage,
         primary_regions: tuple[Region, ...],
-        primary_config: str,
         fallback_regions: tuple[tuple[Region, ...], ...],
-        fallback_configs: tuple[str, ...],
         try_rotation: bool,
         regex: re.Pattern[str],
     ) -> OcrResult | None:
         """Cascade until a regex hit lands, or return None.
 
-        Tier 1: primary regions × primary config (the fast path).
-        Tier 2: each fallback region set × primary config.
-        Tier 3: each fallback PSM/config × primary regions.
-        Tier 4: rotate 90/180/270 and re-run primary regions × primary config.
+        Tier 1: primary regions (the fast path).
+        Tier 2: each fallback region set.
+        Tier 3: rotate 90 / 180 / 270 and re-run primary regions.
 
         First hit wins; later tiers are not consulted. Worst case for a
-        hard miss with the Invoice config is ~7 Tesseract calls.
+        hard miss with the Invoice config is 1 + len(fallback_regions)
+        + 3 DocTR calls.
         """
         # Tier 1: primary
-        match: OcrMatch | None = self.extract(
-            binary, primary_regions, regex, primary_config
-        )
+        match: OcrMatch | None = self.extract(bgr, primary_regions, regex)
         if match is not None:
             return OcrResult(match=match, rotation_degrees=0)
 
         # Tier 2: fallback regions
         for region_set in fallback_regions:
-            match = self.extract(binary, region_set, regex, primary_config)
+            match = self.extract(bgr, region_set, regex)
             if match is not None:
                 return OcrResult(match=match, rotation_degrees=0)
 
-        # Tier 3: fallback configs (e.g., PSM 11/12)
-        for config in fallback_configs:
-            match = self.extract(binary, primary_regions, regex, config)
-            if match is not None:
-                return OcrResult(match=match, rotation_degrees=0)
-
-        # Tier 4: rotate the binary in 90° increments and retry primary.
+        # Tier 3: rotate the input in 90° increments and retry primary.
         if try_rotation:
             for angle in self.ROTATION_ANGLES:
-                rotated: GrayImage = np.rot90(binary, k=angle // 90)
-                match = self.extract(
-                    rotated, primary_regions, regex, primary_config
-                )
+                rotated: BgrImage = np.rot90(bgr, k=angle // 90)
+                match = self.extract(rotated, primary_regions, regex)
                 if match is not None:
                     return OcrResult(match=match, rotation_degrees=angle)
 
         return None
+
+    def _recognize(self, bgr_crop: BgrImage) -> str:
+        """Run DocTR on a single BGR crop, return concatenated word text."""
+        # Small crops (e.g. the top-right header strip) lose glyph
+        # detail at native resolution. Upscale before recognition; the
+        # detection grid scales accordingly.
+        if min(bgr_crop.shape[:2]) < self.UPSCALE_THRESHOLD_PX:
+            bgr_crop = cv2.resize(
+                bgr_crop, None,
+                fx=self.UPSCALE_FACTOR, fy=self.UPSCALE_FACTOR,
+                interpolation=cv2.INTER_CUBIC,
+            )
+        rgb: np.ndarray = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2RGB)
+        result: Any = _get_doctr_ocr_model()([rgb])
+        page: Any = result.pages[0]
+        words: list[str] = [
+            word.value
+            for block in page.blocks
+            for line in block.lines
+            for word in line.words
+        ]
+        return " ".join(words)
 
 
 # -----------------------------------------------------------------------------
@@ -2069,7 +2045,6 @@ class Pipeline:
         self,
         config: Config,
         registry: DocumentTypeRegistry,
-        ocr_preparer: OcrPreparer,
         ocr_engine: OcrEngine,
         storage_preparer: StoragePreparer,
         odoo_client: OdooClient,
@@ -2080,7 +2055,6 @@ class Pipeline:
     ) -> None:
         self._config: Config = config
         self._registry: DocumentTypeRegistry = registry
-        self._ocr_preparer: OcrPreparer = ocr_preparer
         self._ocr_engine: OcrEngine = ocr_engine
         self._storage_preparer: StoragePreparer = storage_preparer
         self._odoo: OdooClient = odoo_client
@@ -2123,8 +2097,7 @@ class Pipeline:
         return cls(
             config=config,
             registry=registry,
-            ocr_preparer=OcrPreparer(),
-            ocr_engine=OcrEngine(config.tesseract_bin),
+            ocr_engine=OcrEngine(),
             storage_preparer=StoragePreparer(),
             odoo_client=odoo,
             archiver=archiver,
@@ -2170,13 +2143,11 @@ class Pipeline:
         cleaned: BgrImage = doc_type.preprocess(bgr)
 
         # 3. OCR pass — cascade through fallbacks if the primary misses.
-        binary: GrayImage = self._ocr_preparer.binarize(cleaned)
+        # DocTR works on color BGR directly; no separate binarize step.
         result: OcrResult | None = self._ocr_engine.extract_with_fallbacks(
-            binary,
+            cleaned,
             primary_regions=doc_type.config.search_regions,
-            primary_config=doc_type.config.tesseract_config,
             fallback_regions=doc_type.config.fallback_search_regions,
-            fallback_configs=doc_type.config.fallback_tesseract_configs,
             try_rotation=doc_type.config.ocr_try_rotation,
             regex=doc_type.regex,
         )

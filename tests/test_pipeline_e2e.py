@@ -22,7 +22,6 @@ from docscanner import (
     FileWatcher,
     Mailer,
     OcrEngine,
-    OcrPreparer,
     OdooClient,
     Pipeline,
     ProcessedLedger,
@@ -43,7 +42,6 @@ def _write_test_config(path: Path, inbox: Path) -> None:
     cfg = {
         "retry": 2,
         "retry_sleep": 0.2,
-        "tesseract-bin": shutil.which("tesseract") or "/usr/bin/tesseract",
         "done-path": "done",
         "error-email": "",  # disable mailer for test
         "error-mail-message": "",
@@ -72,11 +70,7 @@ def _write_test_config(path: Path, inbox: Path) -> None:
                 "mime-types": ["image/jpeg", "image/png"],
                 "ocr_regex": r"R?INV/20\d{2}/\d{4,5}",
                 "search_regions": [[60, 0, 100, 25], [20, 30, 80, 70]],
-                "tesseract_config": "--psm 6 -l eng",
                 "fallback_search_regions": [[[0, 0, 100, 100]]],
-                "fallback_tesseract_configs": [
-                    "--psm 11 -l eng", "--psm 12 -l eng",
-                ],
                 "ocr_try_rotation": True,
                 "odoo_sequence": "INV",
                 "odoo_object": "account.move",
@@ -206,7 +200,7 @@ class TestPipelineE2E:
 
         from docscanner import (
             Archiver, Config, DocumentTypeRegistry, Mailer, OcrEngine,
-            OcrPreparer, OdooClient, Pipeline, ProcessedLedger,
+            OdooClient, Pipeline, ProcessedLedger,
             StatsTracker, StoragePreparer,
         )
 
@@ -244,7 +238,7 @@ class TestPipelineE2E:
         )
         pipeline = Pipeline(
             config=config, registry=registry,
-            ocr_preparer=OcrPreparer(), ocr_engine=OcrEngine(config.tesseract_bin),
+            ocr_engine=OcrEngine(),
             storage_preparer=StoragePreparer(),
             odoo_client=odoo, archiver=archiver, ledger=ledger,
             mailer=_SpyMailer(),
@@ -264,13 +258,13 @@ class TestPipelineE2E:
         assert attach is not None, "email must carry an attachment"
         name, payload, mime = attach
         # The attached bytes are the cleaned StoragePreparer output:
-        # mime is image/jpeg or image/png (never application/octet-stream),
-        # filename uses the matching extension, and the payload decodes
-        # as a real image rather than being the raw input bytes.
-        assert mime in {"image/jpeg", "image/png"}, (
+        # mime is image/png (never application/octet-stream), filename
+        # uses the .png extension, and the payload decodes as a real
+        # image rather than being the raw input bytes.
+        assert mime == "image/png", (
             f"expected cleaned-image mime, got {mime!r}"
         )
-        assert name.endswith((".jpg", ".png"))
+        assert name.endswith(".png")
         decoded = cv2.imdecode(
             np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_GRAYSCALE
         )
@@ -302,14 +296,13 @@ class TestPipelineE2E:
         cv2.imwrite(str(target), page)
         outcome = pipeline.process(target)
         assert not outcome.success
-        # Under v2 the file lands in done/unreadable/ as the CLEANED
-        # version (yellow-stripped, background-snapped) so the office
-        # reviewer gets a readable image, not the messy original. The
-        # extension follows the encoder choice (jpg if ≤300 KB else png).
+        # The file lands in done/unreadable/ as the CLEANED v3 composite
+        # (decompose → composite → downsample → Q8 PNG) so the office
+        # reviewer gets a readable image, not the messy original.
         unreadable_dir = harness_inbox / "done" / "unreadable"
         archived = list(unreadable_dir.glob(f"{target.stem}.*"))
         assert archived, f"no archived file matching {target.stem}.* in {unreadable_dir}"
-        assert archived[0].suffix in {".jpg", ".png"}, (
+        assert archived[0].suffix == ".png", (
             f"unexpected extension {archived[0].suffix!r}"
         )
         # And the source must be removed from the inbox.

@@ -5,7 +5,6 @@
 #   "opencv-python-headless>=4.10",
 #   "Pillow>=11.0",
 #   "numpy>=2.0",
-#   "pytesseract>=0.3.13",
 #   "python-magic>=0.4.27",
 #   "PyYAML>=6.0",
 #   "watchdog>=5.0",

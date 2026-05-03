@@ -20,7 +20,6 @@ from docscanner import (
 SAMPLE_CONFIG: dict = {
     "retry": 3,
     "retry_sleep": 1.0,
-    "tesseract-bin": "/usr/bin/tesseract",
     "done-path": "done",
     "error-email": "ops@example.com",
     "error-mail-message": "Failed to read invoice",
@@ -45,7 +44,6 @@ SAMPLE_CONFIG: dict = {
             "mime-types": ["image/jpeg", "image/png"],
             "ocr_regex": r"R?INV/20\d{2}/\d{4,5}",
             "search_regions": [[60, 0, 100, 25], [20, 30, 80, 70]],
-            "tesseract_config": "--psm 6 -l eng",
             "odoo_sequence": "INV",
             "odoo_object": "account.move",
             "odoo_attachment_tag_id": 1,
@@ -107,7 +105,6 @@ class TestConfig:
         assert cfg.server.smtp_use_tls is False
         assert cfg.server.verify_tls is False
         assert cfg.retry == 3
-        assert cfg.tesseract_bin == "/usr/bin/tesseract"
 
     def test_loads_invoice_document_type(self, config_path: Path) -> None:
         cfg = Config.load(config_path, "harness")
@@ -219,7 +216,6 @@ class TestDocumentTypeRegistry:
                 "mime-types": ["application/pdf"],
                 "ocr_regex": r"REC/\d+",
                 "search_regions": [[0, 0, 100, 50]],
-                "tesseract_config": "--psm 6 -l eng",
                 "odoo_sequence": "REC",
                 "odoo_object": "account.move",
                 "odoo_attachment_tag_id": 1,

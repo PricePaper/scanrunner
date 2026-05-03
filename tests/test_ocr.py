@@ -1,7 +1,13 @@
-"""Contract tests for OcrPreparer and OcrEngine on real invoice samples."""
+"""Contract tests for OcrEngine on real invoice samples.
+
+v3.5 backend: DocTR detection + recognition (no Tesseract). The engine
+takes a BGR image (no separate binarization step), invokes DocTR's
+``ocr_predictor`` once per region crop, and matches the configured
+regex against the recognized text. Rotation cascade unchanged: try
+0° → 90° → 180° → 270° on the original until a hit lands.
+"""
 
 import re
-import shutil
 from pathlib import Path
 
 import cv2
@@ -12,41 +18,10 @@ from docscanner import (
     Invoice,
     OcrEngine,
     OcrMatch,
-    OcrPreparer,
     OcrResult,
     Region,
     YellowRemover,
 )
-
-
-@pytest.fixture(scope="module")
-def tesseract_bin() -> str:
-    bin_path = shutil.which("tesseract")
-    if not bin_path:
-        pytest.skip("tesseract binary not on PATH")
-    return bin_path
-
-
-# ---------------------------------------------------------------------------
-# OcrPreparer
-# ---------------------------------------------------------------------------
-
-
-class TestOcrPreparer:
-    def test_outputs_binary_image(self) -> None:
-        gray = np.full((300, 300), 200, dtype=np.uint8)
-        cv2.putText(gray, "INV/2026/05000", (20, 150), cv2.FONT_HERSHEY_SIMPLEX,
-                    1.5, 0, 3)
-        binary = OcrPreparer().binarize(gray)
-        assert binary.dtype == np.uint8
-        # Adaptive threshold output is mostly 0 / 255.
-        unique = set(np.unique(binary).tolist())
-        assert unique <= {0, 255}
-
-    def test_accepts_color_input(self) -> None:
-        bgr = np.full((300, 300, 3), (200, 200, 200), dtype=np.uint8)
-        binary = OcrPreparer().binarize(bgr)
-        assert binary.shape == (300, 300)
 
 
 # ---------------------------------------------------------------------------
@@ -65,19 +40,23 @@ def _expected_invoice_name(path: Path) -> str:
     return f"{prefix}/{year}/{num}"
 
 
+def _to_bgr(gray: np.ndarray) -> np.ndarray:
+    """DocTR expects color input. Tests render synthetic pages on grayscale
+    canvases for compactness; convert to 3-channel BGR before passing in."""
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
 class TestOcrEngine:
     def test_extracts_invoice_number_from_real_sample(
         self,
         first_good_invoice: Path,
-        tesseract_bin: str,
     ) -> None:
         bgr = cv2.imread(str(first_good_invoice))
         cleaned = YellowRemover().remove(bgr)
-        binary = OcrPreparer().binarize(cleaned)
         regions = (Region(60, 0, 100, 25), Region(20, 30, 80, 70))
         regex = re.compile(r"R?INV/20\d{2}/\d{4,5}")
-        engine = OcrEngine(tesseract_bin)
-        match = engine.extract(binary, regions, regex, "--psm 6 -l eng")
+        engine = OcrEngine()
+        match = engine.extract(cleaned, regions, regex)
         assert match is not None, (
             f"Expected to extract invoice number from {first_good_invoice.name}"
         )
@@ -87,20 +66,18 @@ class TestOcrEngine:
         )
 
     def test_returns_none_for_unreadable(
-        self, unreadable_paths: list[Path], tesseract_bin: str
+        self, unreadable_paths: list[Path]
     ) -> None:
         # A truly unreadable scan should return None for our regex.
         regex = re.compile(r"R?INV/20\d{2}/\d{4,5}")
-        engine = OcrEngine(tesseract_bin)
-        prep = OcrPreparer()
+        engine = OcrEngine()
         misses = 0
         for path in unreadable_paths[:5]:  # 5 is enough — these are designed-fail
-            bgr = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+            bgr = cv2.imread(str(path))
             if bgr is None:
                 continue
-            binary = prep.binarize(bgr)
             regions = (Region(60, 0, 100, 25), Region(20, 30, 80, 70))
-            match = engine.extract(binary, regions, regex, "--psm 6 -l eng")
+            match = engine.extract(bgr, regions, regex)
             if match is None:
                 misses += 1
         # Most unreadable samples should not yield a hit. We don't require
@@ -108,36 +85,30 @@ class TestOcrEngine:
         # text; just demand at least one is genuinely unreadable.
         assert misses >= 1, "Expected at least one unreadable to truly fail"
 
-    def test_so_in_text_is_not_matched_as_invoice(
-        self, tesseract_bin: str
-    ) -> None:
+    def test_so_in_text_is_not_matched_as_invoice(self) -> None:
         """A page whose body says 'SO/2026/12345' must not be misread."""
         page = np.full((1200, 1600), 255, dtype=np.uint8)
         cv2.putText(page, "Source: SO/2026/12345", (100, 600),
-                    cv2.FONT_HERSHEY_SIMPLEX, 2.5, 0, 4)
-        binary = OcrPreparer().binarize(page)
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.5, 0, 5)
         regex = re.compile(r"R?INV/20\d{2}/\d{4,5}")
-        engine = OcrEngine(tesseract_bin)
+        engine = OcrEngine()
         regions = (Region(0, 0, 100, 100),)
-        match = engine.extract(binary, regions, regex, "--psm 6 -l eng")
+        match = engine.extract(_to_bgr(page), regions, regex)
         assert match is None, f"SO/… must not match the INV regex (got {match})"
 
-    def test_first_region_wins_when_match_present(
-        self, tesseract_bin: str
-    ) -> None:
+    def test_first_region_wins_when_match_present(self) -> None:
         """If both regions hold an invoice number, the first one is used."""
         page = np.full((2200, 1700), 255, dtype=np.uint8)
         # Top-right header — invoice number that should win.
         cv2.putText(page, "INV/2026/05000", (1100, 200),
-                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, 0, 4)
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, 0, 5)
         # Body — invoice number that must NOT win.
         cv2.putText(page, "INV/2026/99999", (200, 1500),
-                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, 0, 4)
-        binary = OcrPreparer().binarize(page)
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, 0, 5)
         regex = re.compile(r"R?INV/20\d{2}/\d{4,5}")
-        engine = OcrEngine(tesseract_bin)
+        engine = OcrEngine()
         regions = (Region(50, 0, 100, 20), Region(0, 50, 60, 100))
-        match = engine.extract(binary, regions, regex, "--psm 6 -l eng")
+        match = engine.extract(_to_bgr(page), regions, regex)
         assert match is not None
         assert match.name == "INV/2026/05000", (
             f"First region (top-right) should win, got {match.name}"
@@ -152,16 +123,20 @@ class TestOcrEngine:
 
 def _make_invoice_page(text_in_top_right: str | None,
                        text_in_body: str | None) -> np.ndarray:
-    """Synthetic invoice-shaped page (1700×2200 white). Optional text in
-    top-right header and/or body."""
+    """Synthetic invoice-shaped page (1700×2200 white BGR). Optional text
+    in top-right header and/or body. Stroke thickness = 5 — DocTR's
+    detector drops the leading "I" from Hershey-Simplex glyphs at the
+    default thickness=4 because the verticals collapse on bicubic
+    upscale; an extra pixel of stroke keeps it intact.
+    """
     page = np.full((2200, 1700), 255, dtype=np.uint8)
     if text_in_top_right:
         cv2.putText(page, text_in_top_right, (1100, 200),
-                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, 0, 4)
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, 0, 5)
     if text_in_body:
         cv2.putText(page, text_in_body, (200, 1500),
-                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, 0, 4)
-    return page
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, 0, 5)
+    return _to_bgr(page)
 
 
 class TestExtractWithFallbacks:
@@ -169,18 +144,14 @@ class TestExtractWithFallbacks:
     BODY_ONLY = (Region(0, 30, 60, 80),)              # body region
     FULL_PAGE = (Region(0, 0, 100, 100),)             # whole page
     REGEX = re.compile(r"R?INV/20\d{2}/\d{4,5}")
-    PRIMARY_CFG = "--psm 6 -l eng"
 
-    def test_primary_wins_no_rotation(self, tesseract_bin: str) -> None:
+    def test_primary_wins_no_rotation(self) -> None:
         page = _make_invoice_page("INV/2026/05000", None)
-        binary = OcrPreparer().binarize(page)
-        engine = OcrEngine(tesseract_bin)
+        engine = OcrEngine()
         result = engine.extract_with_fallbacks(
-            binary,
+            page,
             primary_regions=self.PRIMARY,
-            primary_config=self.PRIMARY_CFG,
             fallback_regions=(self.FULL_PAGE,),
-            fallback_configs=("--psm 11 -l eng",),
             try_rotation=True,
             regex=self.REGEX,
         )
@@ -188,19 +159,14 @@ class TestExtractWithFallbacks:
         assert result.match.name == "INV/2026/05000"
         assert result.rotation_degrees == 0
 
-    def test_fallback_region_wins_when_primary_misses(
-        self, tesseract_bin: str
-    ) -> None:
+    def test_fallback_region_wins_when_primary_misses(self) -> None:
         # Number is in the body, not the top-right primary region.
         page = _make_invoice_page(None, "INV/2026/05001")
-        binary = OcrPreparer().binarize(page)
-        engine = OcrEngine(tesseract_bin)
+        engine = OcrEngine()
         result = engine.extract_with_fallbacks(
-            binary,
+            page,
             primary_regions=self.PRIMARY,           # body excluded
-            primary_config=self.PRIMARY_CFG,
             fallback_regions=(self.FULL_PAGE,),     # full page picks it up
-            fallback_configs=(),
             try_rotation=False,
             regex=self.REGEX,
         )
@@ -208,18 +174,15 @@ class TestExtractWithFallbacks:
         assert result.match.name == "INV/2026/05001"
         assert result.rotation_degrees == 0
 
-    def test_rotation_180_wins(self, tesseract_bin: str) -> None:
+    def test_rotation_180_wins(self) -> None:
         page = _make_invoice_page("INV/2026/05002", None)
         # Rotate 180° so primary OCR fails until the cascade rotates it back.
         page_rot = np.rot90(page, k=2)
-        binary = OcrPreparer().binarize(page_rot)
-        engine = OcrEngine(tesseract_bin)
+        engine = OcrEngine()
         result = engine.extract_with_fallbacks(
-            binary,
+            page_rot,
             primary_regions=self.PRIMARY,
-            primary_config=self.PRIMARY_CFG,
             fallback_regions=(),
-            fallback_configs=(),
             try_rotation=True,
             regex=self.REGEX,
         )
@@ -227,40 +190,30 @@ class TestExtractWithFallbacks:
         assert result.match.name == "INV/2026/05002"
         assert result.rotation_degrees == 180
 
-    def test_all_miss_returns_none(self, tesseract_bin: str) -> None:
+    def test_all_miss_returns_none(self) -> None:
         page = _make_invoice_page(None, "Source: SO/2026/77777")  # SO never matches INV
-        binary = OcrPreparer().binarize(page)
-        engine = OcrEngine(tesseract_bin)
+        engine = OcrEngine()
         result = engine.extract_with_fallbacks(
-            binary,
+            page,
             primary_regions=self.PRIMARY,
-            primary_config=self.PRIMARY_CFG,
             fallback_regions=(self.FULL_PAGE,),
-            fallback_configs=("--psm 11 -l eng",),
             try_rotation=True,
             regex=self.REGEX,
         )
         assert result is None
 
-    def test_no_fallbacks_no_rotation_matches_extract_behavior(
-        self, tesseract_bin: str
-    ) -> None:
+    def test_no_fallbacks_no_rotation_matches_extract_behavior(self) -> None:
         """With empty fallbacks and rotation off, cascade is just `extract`."""
         page = _make_invoice_page("INV/2026/05003", None)
-        binary = OcrPreparer().binarize(page)
-        engine = OcrEngine(tesseract_bin)
+        engine = OcrEngine()
         result = engine.extract_with_fallbacks(
-            binary,
+            page,
             primary_regions=self.PRIMARY,
-            primary_config=self.PRIMARY_CFG,
             fallback_regions=(),
-            fallback_configs=(),
             try_rotation=False,
             regex=self.REGEX,
         )
-        direct = engine.extract(
-            binary, self.PRIMARY, self.REGEX, self.PRIMARY_CFG
-        )
+        direct = engine.extract(page, self.PRIMARY, self.REGEX)
         assert result is not None and direct is not None
         assert result.match == direct
         assert result.rotation_degrees == 0
