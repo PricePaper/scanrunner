@@ -495,6 +495,30 @@ class Encoder:
         return buf.getvalue()
 
 
+# --- shared substrate-aware ink threshold ------------------------------------
+# Both PrintedLayerExtractor and HandwrittenLayerExtractor classify a pixel as
+# ink when its grayscale value drops more than
+#   INK_DARKER_THAN_PAPER_BASE + INK_DARKER_THAN_PAPER_VAR_COEFF * paper_variation
+# below the paper's grayscale equivalent. Sharing the constants keeps the two
+# extractors' "darker than paper" decisions calibrated identically; if one ever
+# needs to tighten, both should move together.
+INK_DARKER_THAN_PAPER_BASE: int = 60
+INK_DARKER_THAN_PAPER_VAR_COEFF: float = 2.0
+
+
+def _paper_color_to_grayscale(bgr_color: BgrColor) -> int:
+    """Convert a BGR paper color to its grayscale equivalent (BT.601 weights).
+
+    BT.601 matches ``cv2.COLOR_BGR2GRAY``, so a comparison between this
+    return value and a ``cv2.cvtColor(..., COLOR_BGR2GRAY)`` array is
+    apples-to-apples.
+    """
+    paper_blue, paper_green, paper_red = bgr_color
+    return int(round(
+        0.114 * paper_blue + 0.587 * paper_green + 0.299 * paper_red
+    ))
+
+
 # --- estimate_paper_tone -----------------------------------------------------
 # Substrate-population selection uses an adaptive luminance percentile rather
 # than a fixed V threshold so the same code handles white, cream, and yellow
@@ -589,16 +613,6 @@ class PrintedLayerExtractor:
     intersected with a substrate-aware "darker than paper" pixel test to
     convert padded boxes into pixel-precise stroke masks.
     """
-
-    DARKER_THAN_PAPER_BASE: ClassVar[int] = 60
-    """Base grayscale gap (in uint8 units) below the paper's grayscale
-    equivalent for a pixel to count as ink. Tuned to catch dark laser
-    strokes while ignoring anti-aliased halo pixels at the stroke edge."""
-
-    DARKER_THAN_PAPER_VAR_COEFF: ClassVar[float] = 2.0
-    """Per-unit ``paper_variation`` widening of the threshold. Noisier
-    substrates (yellow paper, ΔE ~1.9) need more headroom so substrate
-    micro-variation does not cross the ink threshold."""
 
     MIN_LINE_RECOGNITION_CONFIDENCE: ClassVar[float] = 0.75
     """Minimum median word recognition confidence required to classify a
@@ -785,24 +799,123 @@ class PrintedLayerExtractor:
     ) -> np.ndarray:
         """Return a boolean mask of pixels substantially darker than paper.
 
-        Converts ``paper_color`` to grayscale with BT.601 weights (the
-        same weights ``cv2.COLOR_BGR2GRAY`` uses, which is how
-        ``grayscale`` was computed) so the comparison is apples-to-apples.
         The threshold widens with ``paper_variation`` so noisier
         substrates (yellow stock, ΔE ~1.9) do not flood the mask with
         substrate micro-variation.
         """
-        paper_blue, paper_green, paper_red = paper_color
-        paper_grayscale: int = int(round(
-            0.114 * paper_blue
-            + 0.587 * paper_green
-            + 0.299 * paper_red
-        ))
+        paper_grayscale: int = _paper_color_to_grayscale(paper_color)
         threshold: float = (
-            self.DARKER_THAN_PAPER_BASE
-            + self.DARKER_THAN_PAPER_VAR_COEFF * paper_variation
+            INK_DARKER_THAN_PAPER_BASE
+            + INK_DARKER_THAN_PAPER_VAR_COEFF * paper_variation
         )
         return grayscale < (paper_grayscale - threshold)
+
+
+@dataclass(frozen=True, slots=True)
+class HandwrittenLayer:
+    """v3 carrier: handwritten ink (pen, pencil, marker, signature) lifted off a scanned page.
+
+    Mirrors :class:`PrintedLayer` in shape so the downstream composer can
+    render the two layers with the same primitives.
+
+    Attributes:
+        mask: Boolean ndarray of shape ``(H, W)``. ``True`` where a pixel
+            belongs to handwritten ink, ``False`` elsewhere. Must never
+            overlap with the printed layer's mask -- the printed layer
+            takes precedence and the handwritten extractor is required
+            to avoid claiming any pixel already in ``printed_mask``.
+        tones: ``uint8`` ndarray of shape ``(H, W)``. Grayscale ink tones
+            preserved from the original scan at masked positions; values
+            outside the mask are unspecified but must be valid ``uint8``.
+    """
+
+    mask: np.ndarray
+    tones: np.ndarray
+
+
+class HandwrittenLayerExtractor:
+    """Extract the handwritten-content layer from a scanned page (v3 phase 3).
+
+    Sibling of :class:`PrintedLayerExtractor` in the layered v3 model.
+    Both extractors share the same substrate-aware "darker than paper"
+    ink test (see :data:`INK_DARKER_THAN_PAPER_BASE` /
+    :data:`INK_DARKER_THAN_PAPER_VAR_COEFF`), but differ in which pixels
+    they claim: printed runs first and stamps confidently-recognized
+    word boxes; handwriting runs second and is forbidden from claiming
+    any pixel already in ``printed_mask``. This precedence rule ensures
+    every ink pixel has exactly one owner so the downstream composer
+    never renders the same stroke twice.
+    """
+
+    MIN_INK_COMPONENT_AREA_PX: ClassVar[int] = 12
+    """Minimum connected-component area for an ink blob to qualify
+    as handwriting. Smaller blobs (<= 11 px) are paper micro-noise,
+    speckle, or sub-stroke fragments. Real pen strokes -- even the
+    dot of an 'i' -- exceed this at 200 DPI. Calibrated against the
+    blank-paper coverage ceiling (0.1%) without compromising the
+    handwriting coverage floor (0.5%)."""
+
+    def __init__(self) -> None:
+        """Build a stateless extractor; no model load required."""
+
+    def extract(
+        self,
+        bgr: BgrImage,
+        paper_color: BgrColor,
+        paper_variation: float,
+        printed_mask: np.ndarray,
+    ) -> HandwrittenLayer:
+        """Extract the handwritten layer from ``bgr``.
+
+        Args:
+            bgr: BGR scan of the page (or a sub-crop). Shape ``(H, W, 3)``.
+            paper_color: Median BGR color of the paper substrate, from
+                :func:`estimate_paper_tone`. Anchors the "darker than
+                paper" decision across white, cream, and yellow stocks.
+            paper_variation: ΔE_lab spread of the paper population, from
+                :func:`estimate_paper_tone`. Widens the ink threshold on
+                noisier substrates.
+            printed_mask: Boolean ``(H, W)`` mask of pixels already
+                claimed by the printed layer. The returned handwritten
+                mask is guaranteed disjoint from this input.
+
+        Returns:
+            A :class:`HandwrittenLayer` whose ``mask`` (bool) and
+            ``tones`` (uint8) arrays both share the input's ``(H, W)``.
+        """
+        tones: np.ndarray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+        # Substrate-aware ink test, identical to PrintedLayerExtractor's.
+        paper_grayscale: int = _paper_color_to_grayscale(paper_color)
+        threshold: float = (
+            INK_DARKER_THAN_PAPER_BASE
+            + INK_DARKER_THAN_PAPER_VAR_COEFF * paper_variation
+        )
+        ink_mask: np.ndarray = tones < (paper_grayscale - threshold)
+
+        # Precedence rule: handwriting only sees what printed didn't claim.
+        candidate_mask: np.ndarray = ink_mask & ~printed_mask
+
+        # Drop sub-area connected components -- paper micro-noise.
+        # 8-connectivity matches FaintInkRescuer / EdgeCleaner conventions
+        # elsewhere in this file.
+        n_labels: int
+        labels: np.ndarray
+        stats: np.ndarray
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            candidate_mask.astype(np.uint8), connectivity=8,
+        )
+        # Vectorized CC area filter: keep[label_id] is True when that
+        # component clears the area floor. Background (label 0) is always
+        # rejected so it never bleeds into the final mask.
+        areas: np.ndarray = stats[:, cv2.CC_STAT_AREA]
+        keep: np.ndarray = areas >= self.MIN_INK_COMPONENT_AREA_PX
+        keep[0] = False
+        # `labels` is int; broadcasting `keep[labels]` produces the per-pixel
+        # bool mask of "label index is among kept indices."
+        mask: np.ndarray = keep[labels]
+
+        return HandwrittenLayer(mask=mask, tones=tones)
 
 
 class StoragePreparer:
