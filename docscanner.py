@@ -10,6 +10,8 @@
 #   "PyYAML>=6.0",
 #   "watchdog>=5.0",
 #   "httpx[http2]>=0.27",
+#   "python-doctr>=1.0",
+#   "torch>=2.4",
 # ]
 # ///
 """scanrunner v2.0 — clean-room rewrite.
@@ -189,6 +191,59 @@ class BackgroundSnapper:
         snapped: GrayImage = gray.copy()
         snapped[fg_mask == 0] = 255
         return snapped, fg_mask
+
+
+class InkRegionDetector:
+    """Locates text/handwriting regions on a page via DocTR's pretrained
+    detector.
+
+    Used as a "permission slip" mask downstream: pixels OUTSIDE detected
+    ink regions get force-snapped to white, which kills the marbled
+    paper-texture speckle that the snapper + rescuer would otherwise
+    produce on margin paper. Pixels INSIDE detected regions go through
+    the existing precision pipeline unchanged.
+
+    The DocTR model loads on first ``detect()`` call and is cached at
+    the class level — across a worker's lifetime the model is loaded
+    exactly once. Each ProcessPool worker pays the load once on its
+    first file (~3-5 s); subsequent files in that worker are fast.
+    """
+
+    PADDING_PX: ClassVar[int] = 18
+    """Pixels to pad each detected word bbox before stamping into the
+    mask. DocTR returns tight boxes; padding captures stroke edges
+    (anti-aliased halos that fall just outside the glyph) and adjacent
+    short marks (commas, accents, the dot of a check-mark)."""
+
+    _model: ClassVar[Any | None] = None
+
+    @classmethod
+    def _get_model(cls) -> Any:
+        if cls._model is None:
+            # Defer the heavy import so module load doesn't drag torch in.
+            from doctr.models import detection_predictor
+            cls._model = detection_predictor(pretrained=True)
+        return cls._model
+
+    def detect(self, bgr: BgrImage) -> np.ndarray:
+        """Return a boolean mask of shape ``bgr.shape[:2]`` covering all
+        detected text/ink regions plus ``PADDING_PX`` of slack on each side."""
+        # DocTR expects RGB.
+        rgb: np.ndarray = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        results: list[dict[str, np.ndarray]] = self._get_model()([rgb])
+        h: int
+        w: int
+        h, w = bgr.shape[:2]
+        mask: np.ndarray = np.zeros((h, w), dtype=np.uint8)
+        words: np.ndarray = results[0].get("words", np.empty((0, 5)))
+        pad: int = self.PADDING_PX
+        for x_min, y_min, x_max, y_max, _conf in words:
+            x1: int = max(0, int(x_min * w) - pad)
+            y1: int = max(0, int(y_min * h) - pad)
+            x2: int = min(w, int(x_max * w) + pad)
+            y2: int = min(h, int(y_max * h) + pad)
+            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, thickness=-1)
+        return mask > 0
 
 
 class FaintInkRescuer:
@@ -456,6 +511,7 @@ class StoragePreparer:
         edge_cleaner: EdgeCleaner | None = None,
         edge_crispener: EdgeCrispener | None = None,
         quantizer: ForegroundQuantizer | None = None,
+        ink_detector: InkRegionDetector | None = None,
         encoder: Encoder | None = None,
     ) -> None:
         self._flattener = flattener or BackgroundFlattener()
@@ -464,20 +520,37 @@ class StoragePreparer:
         self._edge_cleaner = edge_cleaner or EdgeCleaner()
         self._edge_crispener = edge_crispener or EdgeCrispener()
         self._quantizer = quantizer or ForegroundQuantizer()
+        self._ink_detector = ink_detector or InkRegionDetector()
         self._encoder = encoder or Encoder()
 
     def prepare(self, cleaned: BgrImage | GrayImage) -> tuple[bytes, str]:
+        # DocTR ink-region detection runs on the full-resolution cleaned
+        # image (the detector benefits from the extra detail). The
+        # resulting mask is downsampled with the image so it stays
+        # aligned with the snapped output.
+        if cleaned.ndim == 2:
+            ink_input: BgrImage = cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR)
+        else:
+            ink_input = cleaned
+        ink_mask_full: np.ndarray = self._ink_detector.detect(ink_input)
         new_w: int = int(cleaned.shape[1] * self.DOWNSAMPLE)
         new_h: int = int(cleaned.shape[0] * self.DOWNSAMPLE)
         scaled: BgrImage | GrayImage = cv2.resize(
             cleaned, (new_w, new_h), interpolation=cv2.INTER_AREA
         )
+        ink_mask: np.ndarray = cv2.resize(
+            ink_mask_full.astype(np.uint8), (new_w, new_h),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
         flat: BgrImage | GrayImage = self._flattener.flatten(scaled)
         snapped: GrayImage
         fg_mask: GrayImage
         snapped, fg_mask = self._snapper.snap(flat)
         snapped, fg_mask = self._rescuer.rescue(snapped, fg_mask, flat)
         snapped = self._edge_cleaner.clean(snapped, fg_mask)
+        # Final precision filter: anything outside the detected ink
+        # regions is paper noise. Force-snap to white.
+        snapped[~ink_mask] = 255
         # Compaction primitives (EdgeCrispener, ForegroundQuantizer) are
         # implemented but NOT wired into the production chain. Both were
         # tried and both damaged faint handwriting / printed text in
