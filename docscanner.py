@@ -130,6 +130,13 @@ class BackgroundFlattener:
     """Flatten illumination by dividing through a large-kernel background estimate.
 
     Removes scanner shadowing and uneven exposure without touching strokes.
+
+    ORPHAN (v2 stage). Not wired into the v3 storage pipeline; the
+    layered DocumentDecomposer handles uneven illumination implicitly
+    via the substrate-aware ink threshold (paper_color +
+    paper_variation from estimate_paper_tone). Retained as a tested
+    primitive in case a future pipeline (e.g. a non-DocTR fallback or
+    a different document type with its own preprocess chain) needs it.
     """
 
     KERNEL: ClassVar[int] = 51
@@ -163,6 +170,13 @@ class BackgroundSnapper:
 
     Foreground pixels keep their grayscale value so signatures and check
     marks reproduce with proper stroke weight.
+
+    ORPHAN (v2 stage). Not wired into the v3 storage pipeline; the
+    layered DocumentDecomposer composites onto an explicit white canvas
+    and the per-layer extractors classify pixels by ink-vs-paper directly,
+    so adaptive-threshold foreground discovery is no longer needed.
+    Retained as a tested primitive for potential reuse in future
+    pipelines.
     """
 
     THRESHOLD_OFFSET: ClassVar[int] = 35
@@ -210,6 +224,13 @@ class InkRegionDetector:
     the class level — across a worker's lifetime the model is loaded
     exactly once. Each ProcessPool worker pays the load once on its
     first file (~3-5 s); subsequent files in that worker are fast.
+
+    ORPHAN (v2 stage). Not wired into the v3 storage pipeline.
+    PrintedLayerExtractor now invokes DocTR's full ocr_predictor
+    (detection + recognition) directly so it can reject low-confidence
+    "text" regions that turn out to be handwriting. This detector-only
+    wrapper remains a tested primitive in case a future caller wants
+    cheaper detection-only word boxes without paying for recognition.
     """
 
     PADDING_PX: ClassVar[int] = 18
@@ -268,6 +289,15 @@ class FaintInkRescuer:
     Isolated faint regions with no detected anchor stay snapped to
     white — each iteration only grows from existing detected ink,
     never bridges across pure paper.
+
+    ORPHAN (v2 stage). Not wired into the v3 storage pipeline; the
+    HandwrittenLayerExtractor catches faint pen ink directly via the
+    substrate-aware "darker than paper" threshold (paper_grayscale -
+    INK_DARKER_THAN_PAPER_BASE - INK_DARKER_THAN_PAPER_VAR_COEFF *
+    paper_variation), without needing iterative neighborhood growing.
+    Retained as a tested primitive — the dilate/anchor/rescue pattern
+    could be useful for future faint-content recovery problems where
+    a paper-tone baseline alone isn't enough.
     """
 
     NEIGHBORHOOD_RADIUS: ClassVar[int] = 20
@@ -343,7 +373,15 @@ class FaintInkRescuer:
 
 
 class EdgeCleaner:
-    """Drop isolated foreground speckle (paper fiber, toner spray); keep strokes."""
+    """Drop isolated foreground speckle (paper fiber, toner spray); keep strokes.
+
+    ORPHAN (v2 stage). Not wired into the v3 storage pipeline;
+    HandwrittenLayerExtractor performs equivalent CC-area filtering
+    (MIN_INK_COMPONENT_AREA_PX = 12) directly inside its extract()
+    method, and PrintedLayerExtractor screens via DocTR word boxes
+    instead of CC area. Retained as a tested primitive in case a
+    future caller needs standalone speckle removal.
+    """
 
     MIN_COMPONENT_AREA: ClassVar[int] = 8
 
@@ -371,6 +409,12 @@ class EdgeCrispener:
     AND surrounded by other intermediate-tone pixels. The first kind costs
     PNG bytes for cosmetic anti-aliasing the eye barely notices; the
     second kind is the actual document content we promised to preserve.
+
+    ORPHAN (compaction primitive). Implemented as a v2 storage-size
+    optimization but never wired into the production pipeline because
+    it damaged faint handwriting and printed text in ways the office
+    found unacceptable. Retained for potential future use under
+    different parameter calibration. v3 has not attempted to revive it.
     """
 
     DARK_THRESHOLD: ClassVar[int] = 60        # pixels ≤ this count as "dark stroke"
@@ -421,6 +465,11 @@ class ForegroundQuantizer:
     PNG deflate compresses far better when the foreground alphabet is
     small. 16 levels (default) keeps signature legibility while reducing
     storage; 8 risks visible banding on ink gradients.
+
+    ORPHAN (compaction primitive). Same fate as EdgeCrispener: never
+    wired in because the office rejected the visible quality loss on
+    faint content. v3 stores tone-preserved grayscale via the layered
+    composite without quantization. Retained for potential future use.
     """
 
     DEFAULT_LEVELS: ClassVar[int] = 16
