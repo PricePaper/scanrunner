@@ -918,6 +918,100 @@ class HandwrittenLayerExtractor:
         return HandwrittenLayer(mask=mask, tones=tones)
 
 
+@dataclass(frozen=True, slots=True)
+class Document:
+    """The v3 layered storage model for a single scanned page.
+
+    Two semantic layers -- printed (laser toner) and handwritten (pen
+    ink) -- composed over an implicit white-paper canvas. Paper is not
+    an explicit layer: whatever the two layers don't claim is paper,
+    rendered as white by :meth:`composite`. Frozen + slotted so the
+    pipeline can pass Documents across stages without defensive copies.
+    """
+
+    shape: tuple[int, int]
+    printed: PrintedLayer
+    handwritten: HandwrittenLayer
+
+    def composite(self) -> np.ndarray:
+        """Render the layered Document back into a single grayscale image.
+
+        Precedence rule: on any pixel claimed by both layers, printed
+        wins. The decomposer's extractors already guarantee disjoint
+        masks on real scans; the order below is defense-in-depth so a
+        hand-built (e.g. test) Document with overlap still resolves
+        deterministically.
+        """
+        # Implicit paper canvas: every pixel starts at paper-white. Any
+        # pixel neither layer claims keeps this value in the output.
+        out = np.full(self.shape, 255, dtype=np.uint8)
+        # Handwritten first, printed second -- the second write wins on
+        # overlap, which encodes the precedence rule above.
+        out[self.handwritten.mask] = self.handwritten.tones[self.handwritten.mask]
+        out[self.printed.mask] = self.printed.tones[self.printed.mask]
+        return out
+
+
+class DocumentDecomposer:
+    """Turn a raw BGR scan into a layered :class:`Document`.
+
+    Orchestrates :func:`estimate_paper_tone` ->
+    :class:`PrintedLayerExtractor` -> :class:`HandwrittenLayerExtractor`
+    and enforces the precedence rule that no single pixel may be claimed
+    by both layers: handwriting only sees pixels printed didn't claim.
+    """
+
+    def __init__(
+        self,
+        printed_extractor: PrintedLayerExtractor | None = None,
+        handwritten_extractor: HandwrittenLayerExtractor | None = None,
+    ) -> None:
+        """Build a decomposer with optional injected extractors.
+
+        Args:
+            printed_extractor: Override for the printed-layer extractor.
+                Defaults to a fresh :class:`PrintedLayerExtractor`.
+            handwritten_extractor: Override for the handwritten-layer
+                extractor. Defaults to a fresh
+                :class:`HandwrittenLayerExtractor`.
+        """
+        self._printed = printed_extractor or PrintedLayerExtractor()
+        self._handwritten = handwritten_extractor or HandwrittenLayerExtractor()
+
+    def decompose(self, bgr: BgrImage) -> Document:
+        """Decompose ``bgr`` into a layered :class:`Document`.
+
+        Args:
+            bgr: BGR scan of a single page. Shape ``(H, W, 3)``.
+
+        Returns:
+            A :class:`Document` whose ``shape`` matches ``bgr.shape[:2]``
+            and whose ``printed`` / ``handwritten`` layers are populated
+            with disjoint masks (printed wins on overlap).
+        """
+        # Estimate the paper substrate first so both extractors can
+        # calibrate their "darker than paper" thresholds against the same
+        # reference -- white, cream, and yellow stocks all flow through
+        # the same code path with no per-substrate branching here.
+        paper_color, paper_variation = estimate_paper_tone(bgr)
+
+        # Printed runs first; handwriting is told which pixels are
+        # already claimed so the precedence rule lives in one place
+        # (inside the handwritten extractor) rather than being repeated here.
+        printed: PrintedLayer = self._printed.extract(
+            bgr, paper_color, paper_variation,
+        )
+        handwritten: HandwrittenLayer = self._handwritten.extract(
+            bgr, paper_color, paper_variation, printed.mask,
+        )
+
+        return Document(
+            shape=bgr.shape[:2],
+            printed=printed,
+            handwritten=handwritten,
+        )
+
+
 class StoragePreparer:
     """Compose the storage pipeline: downsample → flatten → snap → clean → encode.
 
