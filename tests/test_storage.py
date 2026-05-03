@@ -2,7 +2,7 @@
 
 These verify the production reproduction guarantee end-to-end on real
 corpus/invoices/good/ samples: pure-white background, faithful foreground,
-fixed calibrated encoder settings, JPEG≤300KB-or-PNG-fallback rule.
+single calibrated encoder setting (8-level quantized PNG).
 
 StoragePreparer in v3 takes the ORIGINAL bgr scan (no YellowRemover
 preprocessing); the substrate-aware DocumentDecomposer handles yellow
@@ -17,6 +17,7 @@ import pytest
 
 from docscanner import (
     Encoder,
+    ForegroundQuantizer,
     StoragePreparer,
 )
 
@@ -27,29 +28,19 @@ from docscanner import (
 
 
 class TestEncoder:
-    def test_jpeg_returned_for_small_payload(self) -> None:
-        # All-white 100x100 grayscale will encode tiny in JPEG.
+    def test_returns_png_for_any_input(self) -> None:
         gray = np.full((100, 100), 255, dtype=np.uint8)
         payload, mime = Encoder().encode(gray)
-        assert mime == "image/jpeg"
-        assert payload[:3] == b"\xff\xd8\xff"
+        assert mime == "image/png"
+        assert payload[:8] == b"\x89PNG\r\n\x1a\n"
 
-    def test_png_returned_when_jpeg_exceeds_cap(self) -> None:
-        # A high-entropy random grayscale forces the JPEG over the cap.
-        rng = np.random.default_rng(seed=0)
-        gray = rng.integers(0, 256, size=(2000, 2000), dtype=np.uint8)
-        payload, mime = Encoder().encode(gray)
-        # Random noise compresses badly in both formats; we just verify
-        # the cap-then-fallback rule fires.
-        if mime == "image/png":
-            assert payload[:8] == b"\x89PNG\r\n\x1a\n"
-        else:
-            assert len(payload) <= Encoder.SIZE_CAP_BYTES
-
-    def test_jpeg_quality_is_fixed_constant(self) -> None:
-        # The calibrated value is locked in; if anyone changes it without
-        # re-running calibration, this test reminds them.
-        assert Encoder.JPEG_QUALITY == 85
+    def test_quantization_levels_are_calibrated_constant(self) -> None:
+        """The chosen levels (8) and cap (300 KB) come from the
+        2026-05-03 sweep on 168 corpus pages. Q8 was the only candidate
+        hitting ≥90 % fit; if anyone changes either value, they must
+        re-run the calibration sweep first.
+        """
+        assert ForegroundQuantizer.DEFAULT_LEVELS == 8
         assert Encoder.SIZE_CAP_BYTES == 300_000
 
     def test_deterministic_output_across_runs(self) -> None:
@@ -58,6 +49,24 @@ class TestEncoder:
         a, _ = Encoder().encode(gray)
         b, _ = Encoder().encode(gray)
         assert a == b, "Encoder output must be byte-identical for same input"
+
+    def test_foreground_alphabet_is_quantized(self) -> None:
+        """Q8 collapses the foreground (pixels < BACKGROUND_THRESHOLD)
+        to 8 evenly-spaced bins. The decoded image must contain at most
+        9 distinct foreground levels (8 bins + boundary).
+        """
+        # A grayscale ramp guarantees we hit lots of foreground levels.
+        ramp = np.tile(np.arange(256, dtype=np.uint8), (100, 1))
+        payload, _ = Encoder().encode(ramp)
+        decoded = cv2.imdecode(
+            np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_GRAYSCALE
+        )
+        foreground = decoded[decoded < ForegroundQuantizer.BACKGROUND_THRESHOLD]
+        assert foreground.size > 0
+        assert len(np.unique(foreground)) <= 9, (
+            f"foreground alphabet {len(np.unique(foreground))} > 9 "
+            "— quantization didn't run"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -71,18 +80,8 @@ class TestStoragePreparer:
     ) -> None:
         bgr = cv2.imread(str(first_good_invoice))
         payload, mime = StoragePreparer().prepare(bgr)
-        assert mime in {"image/jpeg", "image/png"}
+        assert mime == "image/png"
         assert len(payload) > 0
-
-    def test_jpeg_outputs_respect_300_kb_cap(
-        self, first_good_invoice: Path
-    ) -> None:
-        bgr = cv2.imread(str(first_good_invoice))
-        payload, mime = StoragePreparer().prepare(bgr)
-        if mime == "image/jpeg":
-            assert len(payload) <= 300_000, (
-                f"JPEG payload {len(payload)} bytes exceeds 300 KB cap"
-            )
 
     def test_decoded_storage_image_is_majority_pure_white(
         self, first_good_invoice: Path
@@ -92,29 +91,19 @@ class TestStoragePreparer:
 
         v3 layered model produces an explicitly white canvas (paper is
         not a layer; whatever printed/handwritten don't claim is rendered
-        as 255 by Document.composite()). The page-wide majority assertion
-        is the contract that actually matters — at least 85 % pure 255
-        on PNG, or ≥254 on JPEG (which can fringe ±1 grey-level).
+        as 255 by Document.composite()). At least 85 % of pixels must be
+        pure 255 in the encoded output.
         """
         bgr = cv2.imread(str(first_good_invoice))
-        payload, mime = StoragePreparer().prepare(bgr)
+        payload, _ = StoragePreparer().prepare(bgr)
         decoded = cv2.imdecode(
             np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_GRAYSCALE
         )
         pure_white_fraction: float = float((decoded == 255).sum() / decoded.size)
-        if mime == "image/png":
-            assert pure_white_fraction >= 0.85, (
-                f"PNG: only {pure_white_fraction:.1%} of pixels are pure 255 "
-                "— the layered composite left too much foreground"
-            )
-        else:
-            # JPEG can fringe ±1 grey-level. Allow that into the count.
-            near_white_fraction: float = float(
-                (decoded >= 254).sum() / decoded.size
-            )
-            assert near_white_fraction >= 0.85, (
-                f"JPEG: only {near_white_fraction:.1%} of pixels are ≥254"
-            )
+        assert pure_white_fraction >= 0.85, (
+            f"only {pure_white_fraction:.1%} of pixels are pure 255 "
+            "— the layered composite left too much foreground"
+        )
 
     def test_storage_image_is_smaller_resolution_than_source(
         self, first_good_invoice: Path
@@ -131,21 +120,24 @@ class TestStoragePreparer:
         ratio = (out_w * out_h) / (src_w * src_h)
         assert 0.40 < ratio < 0.50, f"Downsample ratio {ratio:.3f} off-target"
 
-    def test_foreground_keeps_grayscale_levels(
+    def test_foreground_uses_quantized_grayscale_palette(
         self, first_good_invoice: Path
     ) -> None:
-        """Foreground must retain tone — not 1-bit black-or-white."""
+        """Foreground must NOT collapse to pure black-or-white — Q8
+        keeps multiple grayscale tones for signature legibility — but it
+        also must not exceed the calibrated 8-level alphabet.
+        """
         bgr = cv2.imread(str(first_good_invoice))
         payload, _ = StoragePreparer().prepare(bgr)
         decoded = cv2.imdecode(
             np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_GRAYSCALE
         )
-        dark_pixels = decoded[decoded < 200]
-        assert dark_pixels.size > 100
-        unique_levels = len(np.unique(dark_pixels))
-        assert unique_levels > 8, (
-            f"Foreground tone collapsed to {unique_levels} levels — should "
-            "preserve grayscale for signatures and check marks"
+        foreground = decoded[decoded < ForegroundQuantizer.BACKGROUND_THRESHOLD]
+        assert foreground.size > 100
+        unique_levels = len(np.unique(foreground))
+        assert 1 < unique_levels <= 9, (
+            f"foreground has {unique_levels} unique levels — expected "
+            "2..9 (Q8 alphabet plus near-background boundary)"
         )
 
 
@@ -162,20 +154,23 @@ def test_all_samples_produce_valid_output(good_invoice_paths: list[Path]) -> Non
     (~5-15 s/page on CPU). Across 168 samples this is ~30 min. Run
     explicitly with `pytest -m slow`.
 
-    The cap on file size is per-format (JPEG ≤ 300 KB; PNG fallback is
-    unlimited per user spec). We verify mime is one of the two and
-    decode succeeds.
+    The encoder is calibrated so ≥ 90 % of corpus pages fit ≤ 300 KB.
+    We assert that fit ratio holds, and that every payload decodes.
     """
     prep = StoragePreparer()
+    over_cap = 0
     for path in good_invoice_paths:
         bgr = cv2.imread(str(path))
         payload, mime = prep.prepare(bgr)
-        assert mime in {"image/jpeg", "image/png"}, f"{path.name}: bad mime {mime}"
+        assert mime == "image/png", f"{path.name}: unexpected mime {mime}"
         decoded = cv2.imdecode(
             np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_GRAYSCALE
         )
         assert decoded is not None, f"{path.name}: failed to decode payload"
-        if mime == "image/jpeg":
-            assert len(payload) <= Encoder.SIZE_CAP_BYTES, (
-                f"{path.name}: JPEG {len(payload)} > cap"
-            )
+        if len(payload) > Encoder.SIZE_CAP_BYTES:
+            over_cap += 1
+    fit_ratio = (len(good_invoice_paths) - over_cap) / len(good_invoice_paths)
+    assert fit_ratio >= 0.90, (
+        f"only {fit_ratio:.1%} of {len(good_invoice_paths)} samples fit "
+        f"≤ {Encoder.SIZE_CAP_BYTES} bytes (cap-fit calibration regressed)"
+    )

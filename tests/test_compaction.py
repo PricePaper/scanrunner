@@ -170,10 +170,12 @@ class TestForegroundQuantizer:
             f"signature mean intensity drifted too far: {mean_after:.1f}"
         )
 
-    def test_levels_default_is_16(self) -> None:
+    def test_levels_default_is_8(self) -> None:
         # Documentary test: locks the default so encoder size assumptions
         # in StoragePreparer's calibration match what runs in production.
-        assert ForegroundQuantizer.DEFAULT_LEVELS == 16
+        # 8 levels was the only candidate hitting ≥90 % fit ≤ 300 KB on
+        # the 168-page good/ corpus (2026-05-03 sweep).
+        assert ForegroundQuantizer.DEFAULT_LEVELS == 8
 
     def test_real_invoice_keeps_signature_appearance(
         self, first_good_invoice: Path

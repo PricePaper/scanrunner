@@ -463,16 +463,16 @@ class ForegroundQuantizer:
     """Collapse foreground intensities to N evenly-spaced bins.
 
     PNG deflate compresses far better when the foreground alphabet is
-    small. 16 levels (default) keeps signature legibility while reducing
-    storage; 8 risks visible banding on ink gradients.
-
-    ORPHAN (compaction primitive). Same fate as EdgeCrispener: never
-    wired in because the office rejected the visible quality loss on
-    faint content. v3 stores tone-preserved grayscale via the layered
-    composite without quantization. Retained for potential future use.
+    small. The v3 encoder uses 8 levels — calibrated against the full
+    good/ corpus to keep ≥90 % of pages under the 300 KB cap (max 324 KB,
+    median 221 KB). 16 levels was rejected because it only fit 64 % of
+    pages. Layered decomposition (PrintedLayer + HandwrittenLayer)
+    happens *before* quantization, so faint pen ink is already preserved
+    in the foreground mask — the v2 reason for orphaning this stage no
+    longer applies.
     """
 
-    DEFAULT_LEVELS: ClassVar[int] = 16
+    DEFAULT_LEVELS: ClassVar[int] = 8
     BACKGROUND_THRESHOLD: ClassVar[int] = 240   # pixels ≥ this are paper
 
     def __init__(self, levels: int = DEFAULT_LEVELS) -> None:
@@ -493,55 +493,39 @@ class ForegroundQuantizer:
 
 
 # -----------------------------------------------------------------------------
-# Storage encoder — fixed calibrated settings (no runtime quality ladder).
+# Storage encoder — single calibrated setting (KISS, no runtime branches).
 # -----------------------------------------------------------------------------
 #
-# Calibrated 2026-05-01 against 168 samples from inv/good/:
+# Calibrated 2026-05-03 against 168 v3 composites from corpus/invoices/good/:
 #   * downsample factor 2/3 (≈300 dpi → 200 dpi for storage)
-#   * primary: JPEG quality 85, grayscale  (halo ≤ 1.99, ~28% of files fit ≤300 KB)
-#   * fallback: PNG grayscale, optimize=True, compress_level=9
-#       (mean 317 KB, max 505 KB across the 168 samples)
+#   * 8-level foreground quantization (ForegroundQuantizer.DEFAULT_LEVELS)
+#   * PNG grayscale, optimize=True, compress_level=9
+# Result: 91.1 % of pages ≤ 300 KB cap, max 324 KB, p50 221 KB.
 #
-# Format pick is deterministic per file: encode JPEG once; if it exceeds
-# the size cap, encode PNG once. Same input → same output. No quality
-# ladder, no iteration to hit the cap.
+# Sweep also tried JPEG q=60..85 (max 30..54 % fit), Q16+PNG (64 %),
+# WebP q=70 (79 %). None hit the 90 % bar. Q8+PNG won decisively, so
+# the encoder no longer branches per file — same format every time.
 
 
 class Encoder:
-    """JPEG-or-PNG encoder using the single calibrated setting per format.
+    """Quantize foreground to 8 levels and encode as grayscale PNG.
 
-    Per the user's spec: ship JPEG when ≤ ``SIZE_CAP_BYTES``, else fall back
-    to PNG-grayscale. The format pick is the only branch — neither
-    quality nor compression-level varies at runtime.
+    The (payload, mimetype) tuple is preserved so downstream callers can
+    pick the file extension; mimetype is always ``"image/png"``.
     """
 
-    JPEG_QUALITY: ClassVar[int] = 85
-    SIZE_CAP_BYTES: ClassVar[int] = 300_000
+    SIZE_CAP_BYTES: ClassVar[int] = 300_000  # informational; not enforced
+
+    def __init__(self, quantizer: ForegroundQuantizer | None = None) -> None:
+        self._quantizer: ForegroundQuantizer = quantizer or ForegroundQuantizer()
 
     def encode(self, snapped: GrayImage) -> tuple[bytes, str]:
-        """Return (payload, mimetype) for the given storage-ready grayscale image."""
-        jpeg: bytes = self._encode_jpeg(snapped)
-        if len(jpeg) <= self.SIZE_CAP_BYTES:
-            return jpeg, "image/jpeg"
-        return self._encode_png(snapped), "image/png"
-
-    def _encode_jpeg(self, gray: GrayImage) -> bytes:
-        img: Image.Image = Image.fromarray(gray, mode="L")
-        buf: io.BytesIO = io.BytesIO()
-        img.save(
-            buf,
-            format="JPEG",
-            quality=self.JPEG_QUALITY,
-            optimize=True,
-            progressive=True,
-        )
-        return buf.getvalue()
-
-    def _encode_png(self, gray: GrayImage) -> bytes:
-        img: Image.Image = Image.fromarray(gray, mode="L")
+        """Return (payload, mimetype) for the storage-ready grayscale image."""
+        quantized: GrayImage = self._quantizer.quantize(snapped)
+        img: Image.Image = Image.fromarray(quantized, mode="L")
         buf: io.BytesIO = io.BytesIO()
         img.save(buf, format="PNG", optimize=True, compress_level=9)
-        return buf.getvalue()
+        return buf.getvalue(), "image/png"
 
 
 # --- shared substrate-aware ink threshold ------------------------------------
