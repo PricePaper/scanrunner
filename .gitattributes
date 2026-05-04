@@ -2,8 +2,13 @@
 # patterns is encrypted on push and decrypted on checkout for collaborators
 # who hold a registered GPG key. Plaintext only ever exists in the working
 # tree.
+#
+# podman-compose.yaml is intentionally NOT here: the compose references
+# every secret via ${VAR} interpolation, with values supplied by a
+# host-side .env file (gitignored). Reviewers can read the compose
+# without a GPG key, and rotation is a file edit on the host instead of
+# a git commit.
 config.yaml         filter=git-crypt diff=git-crypt
-podman-compose.yaml filter=git-crypt diff=git-crypt
 *.env               filter=git-crypt diff=git-crypt
 *.key               filter=git-crypt diff=git-crypt
 *.pem               filter=git-crypt diff=git-crypt

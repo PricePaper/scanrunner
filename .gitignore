@@ -2,6 +2,13 @@ config.yaml
 scanner.bak/
 scanner/
 
+# Env files for podman-compose. The compose file references ${VAR} for
+# every secret; the actual values live in `.env` next to compose on each
+# host. Never committed.
+.env
+.env.local
+.env.*.local
+
 .run-config/
 .venv/
 __pycache__/

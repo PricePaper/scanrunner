@@ -1,0 +1,37 @@
+services:
+  scanrunner:
+    image: registry.digitalocean.com/pricepaper/scanrunner:latest
+    container_name: scanrunner
+    restart: always
+
+    # Every secret comes from the project-directory `.env` file (read by
+    # podman-compose automatically). The `${VAR:?msg}` form fails up at
+    # `compose up` time if the variable is missing — silent empty-string
+    # auth failures are the worst kind to debug.
+    environment:
+      DS_SERVER:             ${DS_SERVER:-production}
+      DS_PROD_PASSWORD:      ${DS_PROD_PASSWORD:?DS_PROD_PASSWORD must be set in .env}
+      DS_PROD_SMTP_PASSWORD: ${DS_PROD_SMTP_PASSWORD:?DS_PROD_SMTP_PASSWORD must be set in .env}
+
+    volumes:
+      # Inbox + done/ tree. Bind-mount of host directory; SELinux relabel.
+      - /exports/scanner/:/scanner:Z
+      # Daemon config, read-only.
+      - /srv/podman/scanrunner/config.yaml:/etc/docscanner/config.yaml:ro,Z
+      # uv wheel cache + DocTR model weights, persistent across restarts.
+      # The image's entrypoint chowns the volume to the scanner user on
+      # first start, so no `:U` is needed.
+      - scanrunner-cache:/var/cache/scanrunner
+
+    # Run at +10 nice (lower priority) so OCR doesn't crowd out other
+    # services on the host.
+    ulimits:
+      nice:
+        soft: 10
+        hard: 10
+
+volumes:
+  # Named volume; podman creates it on first `compose up`. Survives
+  # container restart / replacement; only `compose down -v` or
+  # `podman volume rm` destroys it.
+  scanrunner-cache:
