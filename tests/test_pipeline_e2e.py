@@ -799,46 +799,90 @@ def _capture_worker_logging_state() -> dict:
     }
 
 
-class TestJpegEoiPreflight:
+class TestIsCompleteFile:
+    """The pre-flight integrity helper dispatches to whichever library
+    natively understands the format: Pillow for images, PyMuPDF / fitz
+    for PDFs. Both are already project deps. Unknown suffixes fall
+    through to True so the pipeline can still try them."""
+
     def test_complete_jpeg_returns_true(self, tmp_path: Path) -> None:
-        from docscanner import _is_complete_jpeg
+        import cv2
+        import numpy as np
+        from docscanner import _is_complete_file
         path = tmp_path / "good.jpg"
-        path.write_bytes(b"\xff\xd8\xff\xe0fake jpeg payload\xff\xd9")
-        assert _is_complete_jpeg(path) is True
+        cv2.imwrite(str(path), np.full((100, 100, 3), 200, dtype=np.uint8))
+        assert _is_complete_file(path) is True
 
     def test_truncated_jpeg_returns_false(self, tmp_path: Path) -> None:
-        from docscanner import _is_complete_jpeg
+        import cv2
+        import numpy as np
+        from docscanner import _is_complete_file
         path = tmp_path / "truncated.jpg"
-        path.write_bytes(b"\xff\xd8\xff\xe0fake jpeg payload but no eoi")
-        assert _is_complete_jpeg(path) is False
+        cv2.imwrite(str(path), np.full((600, 600, 3), 200, dtype=np.uint8))
+        # Chop the last 200 bytes — clobbers EOI and a chunk of the
+        # final scan; PIL.load() should raise.
+        truncated = path.read_bytes()[:-200]
+        path.write_bytes(truncated)
+        assert _is_complete_file(path) is False
+
+    def test_complete_png_returns_true(self, tmp_path: Path) -> None:
+        import cv2
+        import numpy as np
+        from docscanner import _is_complete_file
+        path = tmp_path / "good.png"
+        cv2.imwrite(str(path), np.full((100, 100, 3), 200, dtype=np.uint8))
+        assert _is_complete_file(path) is True
+
+    def test_truncated_png_returns_false(self, tmp_path: Path) -> None:
+        """PNG truncation: same scanner-race risk as JPEG. Pillow's
+        full-decode path raises when IDAT data is incomplete."""
+        import cv2
+        import numpy as np
+        from docscanner import _is_complete_file
+        path = tmp_path / "truncated.png"
+        cv2.imwrite(str(path), np.full((600, 600, 3), 200, dtype=np.uint8))
+        truncated = path.read_bytes()[:-200]
+        path.write_bytes(truncated)
+        assert _is_complete_file(path) is False
+
+    def test_complete_pdf_returns_true(self, tmp_path: Path) -> None:
+        """fitz creates a valid PDF; integrity check should pass."""
+        import fitz
+        from docscanner import _is_complete_file
+        path = tmp_path / "good.pdf"
+        doc = fitz.open()
+        doc.new_page()
+        doc.save(str(path))
+        doc.close()
+        assert _is_complete_file(path) is True
+
+    def test_truncated_pdf_returns_false(self, tmp_path: Path) -> None:
+        """A PDF chopped down to just its header bytes — fitz can't
+        find the xref table and raises."""
+        from docscanner import _is_complete_file
+        path = tmp_path / "truncated.pdf"
+        # Just enough to look like a PDF on a magic-byte sniff but
+        # nowhere near complete. Real scanner-race truncations cut
+        # mid-stream which fitz also rejects.
+        path.write_bytes(b"%PDF-1.4\n% partial\n")
+        assert _is_complete_file(path) is False
 
     def test_empty_file_returns_false(self, tmp_path: Path) -> None:
-        from docscanner import _is_complete_jpeg
+        from docscanner import _is_complete_file
         path = tmp_path / "empty.jpg"
         path.write_bytes(b"")
-        assert _is_complete_jpeg(path) is False
+        assert _is_complete_file(path) is False
 
-    def test_one_byte_file_returns_false(self, tmp_path: Path) -> None:
-        from docscanner import _is_complete_jpeg
-        path = tmp_path / "tiny.jpg"
-        path.write_bytes(b"\xff")
-        assert _is_complete_jpeg(path) is False
-
-    def test_non_jpeg_extension_short_circuits_to_true(
+    def test_unknown_suffix_falls_through_to_true(
         self, tmp_path: Path
     ) -> None:
-        """The pre-flight is a JPEG-specific check. PNG / PDF files
-        have their own integrity surfaces (PNG IEND chunk, PDF %%EOF),
-        but cv2.imread on those paths handles them differently and
-        the EOI marker is meaningless. The helper must return True
-        for non-JPEGs so they fall through to normal processing."""
-        from docscanner import _is_complete_jpeg
-        png = tmp_path / "scan.png"
-        png.write_bytes(b"\x89PNG\r\n\x1a\n short truncated png")  # no IEND
-        assert _is_complete_jpeg(png) is True
-        pdf = tmp_path / "scan.pdf"
-        pdf.write_bytes(b"%PDF-1.4 short")
-        assert _is_complete_jpeg(pdf) is True
+        """Whatever extension neither Pillow nor fitz claims should
+        return True so the pipeline gets a chance to process it (the
+        registry / mime-type filter is the right gate for those)."""
+        from docscanner import _is_complete_file
+        path = tmp_path / "scan.xyz"
+        path.write_bytes(b"some opaque bytes")
+        assert _is_complete_file(path) is True
 
 
 class TestPeriodicSweepLoop:

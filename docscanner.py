@@ -2465,24 +2465,22 @@ class Pipeline:
             )
 
         # 2. Read + per-type preprocess.
-        # Pre-flight: if it's a JPEG, confirm the 0xFFD9 EOI marker is
-        # present. The most common cause of a truncated JPEG is the
-        # daemon racing the scanner — inotify on_closed fired but the
-        # OS hasn't flushed the tail bytes yet (NFS / scanner buffering /
-        # multi-page incremental writes). Bail out without recording a
-        # ledger row or moving the file: the periodic sweep will retry
-        # once the scanner finishes flushing. The libjpeg "Premature end
-        # of JPEG file" warning that cv2 prints to stderr would otherwise
-        # leave us with partial pixel data we'd happily attach to Odoo.
-        if not _is_complete_jpeg(source):
+        # Pre-flight: format-specific structural integrity check.
+        # Truncated JPEG / PNG / PDF (most often the daemon racing the
+        # scanner: inotify on_closed fired before the OS flushed the
+        # file's tail bytes) — bail out without a ledger row or move,
+        # so the periodic sweep retries once the scanner finishes.
+        # Without this, cv2 / fitz happily decode partial buffers into
+        # pixel garbage we'd attach to Odoo.
+        if not _is_complete_file(source):
             self._log.warning(
-                "%s appears truncated (missing JPEG EOI) — leaving in "
-                "inbox; periodic sweep will retry",
+                "%s appears truncated or malformed for its format — "
+                "leaving in inbox; periodic sweep will retry",
                 source.name,
             )
             return ProcessOutcome(
                 source, False, None, None, None, None, None,
-                "truncated JPEG (will retry)",
+                "truncated file (will retry)",
             )
         bgr: BgrImage | None = cv2.imread(str(source))
         if bgr is None:
@@ -2774,33 +2772,54 @@ _WORKER_LOG_FORMAT: str = (
 )
 
 
-_JPEG_SUFFIXES: frozenset[str] = frozenset({".jpg", ".jpeg"})
+_IMAGE_SUFFIXES: frozenset[str] = frozenset({
+    ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".gif", ".webp",
+})
+_PDF_SUFFIXES: frozenset[str] = frozenset({".pdf"})
 
 
-def _is_complete_jpeg(path: Path) -> bool:
-    """True if ``path`` either isn't a JPEG (suffix-based, .png / .pdf
-    fall through to True) or is a JPEG that ends with the 0xFFD9 EOI
-    marker. False for truncated JPEGs and unreadable files.
+def _is_complete_file(path: Path) -> bool:
+    """True if ``path`` is structurally complete for its format.
 
-    Used as a pre-flight check in ``Pipeline._process_inner`` so a
-    daemon that races the scanner — the inotify ``on_closed`` event
-    fires but the file's tail bytes haven't been flushed yet — bails
-    out cleanly instead of feeding cv2 a partial buffer that decodes
-    into pixel garbage and then attaches that garbage to Odoo.
+    The most common reason this returns False is the daemon racing the
+    scanner — inotify ``on_closed`` fires but the OS hasn't flushed the
+    file's tail bytes yet. Without this pre-flight, libjpeg / PIL would
+    print a "Premature end of file" warning to C-level stderr and then
+    cv2 / fitz would happily decode a partial buffer into pixel garbage,
+    which we'd attach to Odoo.
+
+    Dispatches by suffix to whichever library natively understands the
+    format. Both Pillow (image formats) and PyMuPDF / fitz (PDF) are
+    already project deps, and either will raise cleanly on a truncated
+    file when forced to fully parse it (``Image.load()`` for images,
+    ``fitz.open()`` for PDFs). Unknown suffixes fall through to True so
+    the pipeline still gets a chance to process them.
     """
-    if path.suffix.lower() not in _JPEG_SUFFIXES:
+    suffix: str = path.suffix.lower()
+    if suffix in _IMAGE_SUFFIXES:
+        try:
+            with Image.open(path) as im:
+                # .verify() is structural-only and lenient about
+                # missing trailers; .load() forces a full decode and
+                # raises on any truncation. Slight CPU cost we then
+                # repeat with cv2, but data integrity beats a few ms
+                # per file.
+                im.load()
+        except Exception:
+            return False
         return True
-    try:
-        with open(path, "rb") as f:
-            try:
-                f.seek(-2, os.SEEK_END)
-            except OSError:
-                # Files smaller than 2 bytes can't have an EOI marker.
-                return False
-            tail: bytes = f.read(2)
-    except OSError:
-        return False
-    return tail == b"\xff\xd9"
+    if suffix in _PDF_SUFFIXES:
+        try:
+            import fitz  # noqa: PLC0415  — defer heavy import
+            with fitz.open(path) as doc:
+                # Touch the page count to force fitz to walk the
+                # cross-reference table; raises on truncated PDFs.
+                _ = doc.page_count
+        except Exception:
+            return False
+        return True
+    # Unknown suffix — let the pipeline decide what to do with it.
+    return True
 
 
 def _periodic_sweep_loop(
