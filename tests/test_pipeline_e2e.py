@@ -332,6 +332,97 @@ class TestWorkSubmitterLifecycle:
 
 
 # ---------------------------------------------------------------------------
+# Worker logging — INFO must reach stderr in worker subprocesses, not just
+# in the daemon. Without an initializer, ProcessPoolExecutor + forkserver
+# starts each worker with Python's default WARNING-only root config and
+# the per-file outcome lines (`OK INV/...`, `FAIL …`) get silently
+# dropped from container logs.
+# ---------------------------------------------------------------------------
+
+
+def _capture_worker_logging_state() -> dict:
+    """Worker function: report the post-initializer logging state."""
+    import logging
+    root = logging.getLogger()
+    return {
+        "root_level": root.level,
+        "handler_types": [type(h).__name__ for h in root.handlers],
+        "stream_targets": [
+            getattr(h, "stream", None).__class__.__name__
+            for h in root.handlers
+            if isinstance(h, logging.StreamHandler)
+        ],
+        "scanrunner_effective_level": (
+            logging.getLogger("scanrunner.pipeline").getEffectiveLevel()
+        ),
+        "httpx_effective_level": (
+            logging.getLogger("httpx").getEffectiveLevel()
+        ),
+    }
+
+
+class TestWorkerLogging:
+    def test_worker_init_logging_attaches_stream_handler_at_info(self) -> None:
+        """The initializer helper, when called in any process, must leave
+        the root logger with at least one StreamHandler and ``scanrunner.*``
+        flowing at INFO.
+        """
+        from docscanner import _worker_init_logging
+        import logging
+        # Snapshot then reset root state so the test is hermetic.
+        original_handlers = list(logging.getLogger().handlers)
+        original_level = logging.getLogger().level
+        try:
+            logging.getLogger().handlers.clear()
+            _worker_init_logging()
+            root = logging.getLogger()
+            stream_handlers = [
+                h for h in root.handlers if isinstance(h, logging.StreamHandler)
+            ]
+            assert stream_handlers, "no StreamHandler attached to root"
+            scanrunner_level = (
+                logging.getLogger("scanrunner.pipeline").getEffectiveLevel()
+            )
+            assert scanrunner_level <= logging.INFO, (
+                f"scanrunner.* effective level is {scanrunner_level}; "
+                "expected ≤ INFO so per-file outcome lines reach stderr"
+            )
+            httpx_level = logging.getLogger("httpx").getEffectiveLevel()
+            assert httpx_level >= logging.WARNING, (
+                f"httpx wire chatter not suppressed: level={httpx_level}"
+            )
+        finally:
+            logging.getLogger().handlers[:] = original_handlers
+            logging.getLogger().setLevel(original_level)
+
+    def test_worker_subprocess_inherits_info_level_logging(self) -> None:
+        """Spawn a real worker via the same forkserver context the daemon
+        uses, run the initializer, and confirm INFO-level logging is on.
+
+        Without the WorkSubmitter wiring this through ``initializer=`` to
+        ProcessPoolExecutor, the worker would start with the default
+        WARNING-only root config and ``scanrunner_effective_level``
+        would come back as 30 (WARNING).
+        """
+        from concurrent.futures import ProcessPoolExecutor
+        from multiprocessing import get_context
+        import logging
+
+        from docscanner import _worker_init_logging
+
+        ctx = get_context("forkserver")
+        with ProcessPoolExecutor(
+            max_workers=1, mp_context=ctx, initializer=_worker_init_logging,
+        ) as pool:
+            state = pool.submit(_capture_worker_logging_state).result(timeout=30)
+        assert "StreamHandler" in state["handler_types"], (
+            f"worker root has no StreamHandler: {state['handler_types']}"
+        )
+        assert state["scanrunner_effective_level"] <= logging.INFO, state
+        assert state["httpx_effective_level"] >= logging.WARNING, state
+
+
+# ---------------------------------------------------------------------------
 # FileWatcher — observer detects file-close events
 # ---------------------------------------------------------------------------
 

@@ -2300,6 +2300,29 @@ class Pipeline:
 # -----------------------------------------------------------------------------
 
 
+_WORKER_LOG_FORMAT: str = (
+    "%(asctime)s %(processName)s %(levelname)s %(name)s: %(message)s"
+)
+
+
+def _worker_init_logging() -> None:
+    """ProcessPoolExecutor initializer: configure stderr logging.
+
+    forkserver workers start with a fresh interpreter and Python's
+    default WARNING-only root config, so per-file outcome lines emitted
+    by ``scanrunner.pipeline`` (the most useful operational signal)
+    would otherwise be silently dropped from container logs. Wire each
+    worker to the same stderr / format the daemon uses, and silence
+    the same wire-level chatter (httpx / httpcore / urllib3).
+
+    Idempotent: ``logging.basicConfig`` is a no-op if root already has
+    handlers, which it normally won't in a freshly-started worker.
+    """
+    logging.basicConfig(level=logging.INFO, format=_WORKER_LOG_FORMAT)
+    for noisy in ("httpx", "httpcore", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 class WorkSubmitter:
     """Owns the ProcessPoolExecutor and dedupes in-flight submissions."""
 
@@ -2319,9 +2342,13 @@ class WorkSubmitter:
         # arrival rate. Override in YAML for genuinely bursty inboxes.
         self._max_workers: int = max_workers or 1
         # forkserver: predictable startup, no fork-after-thread foot-gun.
+        # Each worker runs _worker_init_logging on startup so its INFO
+        # logs reach stderr (and from there the container log driver).
         ctx: Any = get_context("forkserver")
         self._pool: ProcessPoolExecutor = ProcessPoolExecutor(
-            max_workers=self._max_workers, mp_context=ctx
+            max_workers=self._max_workers,
+            mp_context=ctx,
+            initializer=_worker_init_logging,
         )
         self._inflight: set[str] = set()
         self._lock: threading.Lock = threading.Lock()
@@ -2435,10 +2462,7 @@ class Daemon:
         inbox: Path,
         log_level: int = logging.INFO,
     ) -> None:
-        logging.basicConfig(
-            level=log_level,
-            format="%(asctime)s %(processName)s %(levelname)s %(name)s: %(message)s",
-        )
+        logging.basicConfig(level=log_level, format=_WORKER_LOG_FORMAT)
         # Suppress chatter from httpx / urllib3 wire-level loggers; keep our
         # scanrunner.* loggers at the requested level.
         for noisy in ("httpx", "httpcore", "urllib3"):
