@@ -2331,7 +2331,8 @@ class Pipeline:
             payload, mime = self._storage_preparer.prepare(bgr)
             ext = "jpg" if mime == "image/jpeg" else "png"
 
-        # Snapshot raw bytes BEFORE the move, used as fallback.
+        # Snapshot raw bytes BEFORE any move, used as fallback for the
+        # email attachment. Source is still in the inbox at this point.
         attach: tuple[str, bytes, str] | None = None
         if payload is not None:
             attach = (f"{source.stem}.{ext}", payload, mime)
@@ -2340,14 +2341,20 @@ class Pipeline:
                 sniffed: str = magic.from_file(str(source), mime=True) or "application/octet-stream"
             except Exception:
                 sniffed = "application/octet-stream"
-            attach = (source.name, source.read_bytes(), sniffed)
+            try:
+                attach = (source.name, source.read_bytes(), sniffed)
+            except OSError:
+                attach = None
 
-        try:
-            self._archiver.archive_unreadable(source, payload, ext)
-        except Exception:
-            self._log.exception("could not move %s to unreadable/", source)
-        self._ledger.record_failure(digest, source.name)
-
+        # Email-then-move ordering: notification is the precondition
+        # for any destructive bookkeeping. If the email fails (or can't
+        # be attempted because there's no mailer / no error_email
+        # configured), leave the source in the inbox and skip the
+        # ledger record so the next initial_sweep on container restart
+        # retries it once the operator fixes the SMTP outage. The
+        # failure folder accumulating orphan files nobody knows about
+        # is a worse outcome than the inbox getting visibly stuck.
+        notified: bool = False
         if self._mailer is not None and self._config.error_email and attach is not None:
             try:
                 self._mailer.send_failure(
@@ -2356,8 +2363,30 @@ class Pipeline:
                     body=f"{self._config.error_mail_message}\n\n{error}",
                     attachment=attach,
                 )
+                self._log.info(
+                    "failure email sent for %s to %s",
+                    source.name, self._config.error_email,
+                )
+                notified = True
             except Exception:
-                self._log.exception("could not send failure email for %s", source)
+                self._log.exception(
+                    "failure email send failed for %s — leaving in inbox for retry",
+                    source,
+                )
+                return
+        elif self._mailer is None or not self._config.error_email:
+            # No mailer configured — operator opted into silent failures;
+            # proceed with move + ledger.
+            notified = True
+
+        if not notified:
+            return
+
+        try:
+            self._archiver.archive_unreadable(source, payload, ext)
+        except Exception:
+            self._log.exception("could not move %s to unreadable/", source)
+        self._ledger.record_failure(digest, source.name)
 
 
 # -----------------------------------------------------------------------------

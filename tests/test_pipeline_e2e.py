@@ -351,6 +351,82 @@ class TestPipelineE2E:
             "Pipeline.for_worker did not cap intra-op threads"
         )
 
+    def test_email_failure_keeps_file_in_inbox_no_unreadable_no_ledger(
+        self, harness_inbox: Path, tmp_path: Path
+    ) -> None:
+        """When the failure-notification email itself fails, the source
+        must stay in the inbox so the next restart sweep retries; the
+        ledger must not record anything; the file must not appear in
+        ``done/unreadable/`` (because the operator was never notified —
+        the file would be silently lost otherwise).
+
+        Email-before-move-or-ledger ordering: notification is the
+        precondition for any destructive bookkeeping.
+        """
+        import cv2
+        import numpy as np
+        from docscanner import (
+            Archiver, Config, DocumentTypeRegistry, Mailer, OcrEngine,
+            OdooClient, Pipeline, ProcessedLedger, StatsTracker,
+            StoragePreparer,
+        )
+
+        class _BoomMailer(Mailer):
+            def __init__(self) -> None:
+                super().__init__("localhost", 1, "", "")
+            def send_failure(self, *a, **kw):  # type: ignore[override]
+                raise RuntimeError("simulated SMTP outage")
+
+        config_path = tmp_path / "config.yaml"
+        _write_test_config(config_path, harness_inbox)
+        config = Config.load(str(config_path), "harness")
+        config.error_email = "test@example.invalid"  # any non-empty value
+
+        registry = DocumentTypeRegistry.from_config(config)
+        archiver = Archiver(harness_inbox / "done")
+        ledger = ProcessedLedger(harness_inbox / ".processed_email_fail_test.sqlite3")
+        odoo = OdooClient(
+            url=config.server.url, database=config.server.database,
+            username=config.server.username, password=config.server.password,
+            verify_tls=False,
+        )
+        pipeline = Pipeline(
+            config=config, registry=registry,
+            ocr_engine=OcrEngine(),
+            storage_preparer=StoragePreparer(),
+            odoo_client=odoo, archiver=archiver, ledger=ledger,
+            mailer=_BoomMailer(),
+            stats=StatsTracker(harness_inbox / ".stats_email_fail.yaml"),
+        )
+
+        target = harness_inbox / "Customer_Invoice-email-fail-test.jpg"
+        # Random near-white noise — passes cv2.imread, fails the INV regex.
+        rng = np.random.default_rng(seed=3)
+        page = rng.integers(230, 256, size=(2200, 1700, 3), dtype=np.uint8)
+        cv2.imwrite(str(target), page)
+        try:
+            digest = ProcessedLedger.file_digest(target)
+            outcome = pipeline.process(target)
+            assert not outcome.success
+
+            # Source still in the inbox.
+            assert target.exists(), (
+                "email failure must leave the source in the inbox for retry"
+            )
+            # Not moved to unreadable.
+            unreadable = harness_inbox / "done" / "unreadable" / target.name
+            assert not unreadable.exists(), (
+                "email failure must NOT move the file to done/unreadable/"
+            )
+            # No ledger entry — retry-eligible on next sweep.
+            assert not ledger.has(digest), (
+                "email failure must not record success in the ledger"
+            )
+        finally:
+            target.unlink(missing_ok=True)
+            odoo.close()
+            ledger.close()
+
     def test_unreadable_file_routes_to_unreadable_folder(
         self, harness_inbox: Path, tmp_path: Path
     ) -> None:
