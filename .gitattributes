@@ -1,0 +1,13 @@
+# git-crypt: encrypted-at-rest secret-bearing files. Anything matching these
+# patterns is encrypted on push and decrypted on checkout for collaborators
+# who hold a registered GPG key. Plaintext only ever exists in the working
+# tree.
+config.yaml         filter=git-crypt diff=git-crypt
+podman-compose.yaml filter=git-crypt diff=git-crypt
+*.env               filter=git-crypt diff=git-crypt
+*.key               filter=git-crypt diff=git-crypt
+*.pem               filter=git-crypt diff=git-crypt
+secrets/**          filter=git-crypt diff=git-crypt
+
+# Don't try to encrypt the .gitattributes file itself.
+.gitattributes      !filter !diff
