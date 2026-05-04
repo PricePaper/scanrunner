@@ -23,7 +23,7 @@ set -euo pipefail
 
 IMAGE_REPO="${IMAGE_REPO:-registry.digitalocean.com/pricepaper/scanrunner}"
 BUILD_DATE="$(date +%Y%m%d%H%M)"
-DATED_TAG="${IMAGE_REPO}:2-${BUILD_DATE}"
+DATED_TAG="${IMAGE_REPO}:3.5-${BUILD_DATE}"
 LATEST_TAG="${IMAGE_REPO}:latest"
 BASE="debian:trixie-slim"
 
@@ -93,7 +93,7 @@ buildah config \
   --label "maintainer=Ean J Price <ean@pricepaper.com>" \
   --label "org.opencontainers.image.title=scanrunner" \
   --label "org.opencontainers.image.description=Invoice scan ingest daemon (DocTR + layered v3)." \
-  --label "org.opencontainers.image.version=2-${BUILD_DATE}" \
+  --label "org.opencontainers.image.version=3.5-${BUILD_DATE}" \
   --label "org.opencontainers.image.source=https://github.com/PricePaper/scanrunner" \
   "$ctr"
 
