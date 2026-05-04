@@ -2203,17 +2203,19 @@ class Pipeline:
             )
         ocr: OcrMatch = result.match
         if result.rotation_degrees:
+            # Rotation is interesting — log it. The downstream OK line
+            # already names the file and the extracted invoice number,
+            # so there's no need for a redundant "OCR extracted" line in
+            # the no-rotation case.
             self._log.info(
-                "OCR extracted %s from %s (rotated %d°)",
-                ocr.name, source.name, result.rotation_degrees,
+                "rotated %s by %d° to OCR successfully",
+                source.name, result.rotation_degrees,
             )
             # Keep storage / archive in the orientation that OCR succeeded
             # at — the office reviewer never sees a sideways scan. Rotate
             # the ORIGINAL bgr (not the OCR-preprocessed cleaned), since
             # v3 storage operates on the original via the layered model.
             bgr = np.rot90(bgr, k=result.rotation_degrees // 90)
-        else:
-            self._log.info("OCR extracted %s from %s", ocr.name, source.name)
 
         # 4. Odoo lookup
         odoo_id: int | None = self._odoo.find_record(
@@ -2470,7 +2472,11 @@ class FileWatcher:
         count: int = 0
         for path in sorted(self._inbox.iterdir()):
             if path.is_file() and path.suffix.lower() in self.SUFFIXES:
-                self._log.info("initial-sweep submit: %s", path.name)
+                # Per-file noise — the daemon emits a single summary
+                # ("initial sweep submitted N file(s)") right after this
+                # method returns. Dropping per-file submit logs to DEBUG
+                # so production INFO logs stay tractable.
+                self._log.debug("initial-sweep submit: %s", path.name)
                 self._submitter.submit(path)
                 count += 1
         return count
