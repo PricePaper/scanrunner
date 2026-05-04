@@ -60,6 +60,7 @@ buildah config \
   --env PYTHONUNBUFFERED=1 \
   --env UV_PYTHON_PREFERENCE=only-system \
   --env UV_PYTHON=/usr/bin/python3.13 \
+  --cmd '' \
   --label "maintainer=Ean J Price <ean@pricepaper.com>" \
   --label "org.opencontainers.image.title=scanrunner-base" \
   --label "org.opencontainers.image.description=Base image for scanrunner: Debian trixie + Python 3.13 + uv + gosu + tini." \
