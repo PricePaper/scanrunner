@@ -2286,6 +2286,28 @@ class Pipeline:
                 source.unlink()
             except FileNotFoundError:
                 pass
+            except OSError as e:
+                # Source unlink failed AFTER successful Odoo upload + archive
+                # — file is preserved (Odoo aid + archive), only inbox cleanup
+                # blocked. NEVER let this become a "failure" outcome: that
+                # would trigger the catchall, leave the file in the inbox,
+                # and the next sweep would re-upload, creating a duplicate
+                # in Odoo. Email the operator with the cleaned PNG attached
+                # and the precise paths so they can rm the source by hand.
+                # If the email itself fails, log loudly and continue —
+                # the success outcome is still correct, the file is still
+                # preserved, and the inbox accumulating is the operator's
+                # eventual signal that something needs attention.
+                self._log.warning(
+                    "could not remove processed source %s: %s — file is preserved "
+                    "(aid=%s, archive=%s), emailing operator for manual cleanup",
+                    source, e, attachment_id, archive_path,
+                )
+                self._send_cleanup_failure_email(
+                    source=source, ocr_name=ocr.name, odoo_id=odoo_id,
+                    attachment_id=attachment_id, archive_path=archive_path,
+                    payload=payload, mime=mime, error=str(e),
+                )
 
         self._log.info(
             "OK %s id=%s aid=%s → %s", ocr.name, odoo_id, attachment_id, archive_path
@@ -2293,6 +2315,51 @@ class Pipeline:
         return ProcessOutcome(
             source, True, ocr.name, odoo_id, attachment_id, archive_path, ocr.region, None
         )
+
+    def _send_cleanup_failure_email(
+        self, *, source: Path, ocr_name: str, odoo_id: int,
+        attachment_id: int, archive_path: Path,
+        payload: bytes, mime: str, error: str,
+    ) -> None:
+        """Operator-facing notification when a source can't be removed
+        from the inbox after a successful upload + archive. Reuses the
+        Mailer's send_failure entry point so the body, subject, and
+        attachment all flow through the same tested code path."""
+        if self._mailer is None or not self._config.error_email:
+            self._log.warning(
+                "no error-email configured; cleanup-failure for %s is logged only",
+                source.name,
+            )
+            return
+        ext: str = "jpg" if mime == "image/jpeg" else "png"
+        attach_name: str = f"{ocr_name.replace('/', '-')}_{source.stem}.{ext}"
+        body: str = (
+            f"{self._config.error_mail_message}\n\n"
+            f"{ocr_name} was successfully processed and is preserved:\n"
+            f"  Odoo attachment id : {attachment_id}\n"
+            f"  Odoo record id     : {odoo_id}\n"
+            f"  Archive path       : {archive_path}\n\n"
+            f"However, the daemon could not remove the original source from the\n"
+            f"inbox — please rm it by hand:\n  {source}\n\n"
+            f"Underlying error: {error}\n"
+        )
+        try:
+            self._mailer.send_failure(
+                self._config.error_email,
+                subject=f"[scanrunner] processed {ocr_name} but could not remove source",
+                body=body,
+                attachment=(attach_name, payload, mime),
+            )
+            self._log.info(
+                "cleanup-failure email sent for %s to %s",
+                source.name, self._config.error_email,
+            )
+        except Exception:
+            self._log.exception(
+                "cleanup-failure email send failed for %s — file preserved, "
+                "inbox cleanup still pending operator action",
+                source,
+            )
 
     def _attachment_filename(self, ocr_name: str, original: str, mime: str) -> str:
         ext: str = "jpg" if mime == "image/jpeg" else "png"

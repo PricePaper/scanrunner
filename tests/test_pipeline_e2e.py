@@ -351,6 +351,124 @@ class TestPipelineE2E:
             "Pipeline.for_worker did not cap intra-op threads"
         )
 
+    def test_unlink_failure_emails_operator_and_preserves_outcome(
+        self, harness_inbox: Path, tmp_path: Path
+    ) -> None:
+        """Source ``unlink()`` raising after a successful upload (e.g.
+        operator changed perms mid-flight) must NOT escape into the
+        catchall — that path causes the file to look "failed" while
+        Odoo + archive already hold the data, and the next sweep would
+        re-upload, creating a duplicate.
+
+        Instead: outcome stays success, ledger has the success row,
+        archive present, source still on disk, and the operator gets
+        an EMAIL with the cleaned PNG attached explaining the file is
+        preserved (Odoo aid=… archive=…) and asking for a manual rm.
+        Operators don't tail logs; they read mail.
+        """
+        import cv2
+        from docscanner import (
+            Archiver, Config, DocumentTypeRegistry, Mailer, OcrEngine,
+            OdooClient, Pipeline, ProcessedLedger, StatsTracker,
+            StoragePreparer,
+        )
+
+        captured: list[dict] = []
+
+        class _SpyMailer(Mailer):
+            def __init__(self) -> None:
+                super().__init__("localhost", 1, "", "")
+            def send_failure(self, to_addr, subject, body, attachment=None):  # type: ignore[override]
+                captured.append({
+                    "to": to_addr, "subject": subject, "body": body,
+                    "attachment": attachment,
+                })
+
+        config_path = tmp_path / "config.yaml"
+        _write_test_config(config_path, harness_inbox)
+        config = Config.load(str(config_path), "harness")
+        config.error_email = "test@example.invalid"
+
+        registry = DocumentTypeRegistry.from_config(config)
+        archiver = Archiver(harness_inbox / "done")
+        ledger = ProcessedLedger(harness_inbox / ".processed_unlink_test.sqlite3")
+        odoo = OdooClient(
+            url=config.server.url, database=config.server.database,
+            username=config.server.username, password=config.server.password,
+            verify_tls=False,
+        )
+        pipeline = Pipeline(
+            config=config, registry=registry,
+            ocr_engine=OcrEngine(),
+            storage_preparer=StoragePreparer(),
+            odoo_client=odoo, archiver=archiver, ledger=ledger,
+            mailer=_SpyMailer(),
+            stats=StatsTracker(harness_inbox / ".stats_unlink_test.yaml"),
+        )
+
+        # Use a real harness invoice so Odoo path works end-to-end.
+        src_invoice = next(
+            (harness_inbox.parent / "scanner").glob("**/INV-2026-05000_*.jpg"),
+            None,
+        )
+        if src_invoice is None:
+            src_invoice = next(
+                (Path("/home/ejprice/PycharmProjects/scanrunner/corpus/invoices/good")
+                 .glob("INV-2026-05000_*.jpg")),
+                None,
+            )
+        if src_invoice is None:
+            pytest.skip("no INV-2026-05000 sample available for unlink test")
+        target = harness_inbox / "Customer_Invoice-unlink-fail-test.jpg"
+        target.write_bytes(src_invoice.read_bytes())
+
+        # Force unlink to fail with a permission error after upload + archive.
+        original_unlink = Path.unlink
+        def _boom_unlink(self, *a, **kw):
+            if self == target:
+                raise PermissionError(f"simulated unlink failure on {self}")
+            return original_unlink(self, *a, **kw)
+
+        try:
+            Path.unlink = _boom_unlink  # type: ignore[method-assign]
+            outcome = pipeline.process(target)
+        finally:
+            Path.unlink = original_unlink  # type: ignore[method-assign]
+
+        try:
+            # Outcome is success — Odoo + archive succeeded; only inbox
+            # cleanup failed.
+            assert outcome.success is True, (
+                f"unlink failure must not corrupt success outcome: {outcome.error}"
+            )
+            assert outcome.attachment_id is not None
+            assert outcome.archive_path is not None
+            # Source is still on disk (unlink couldn't remove it).
+            assert target.exists(), "source must remain when unlink fails"
+            # Archive is still present (success-path completed before unlink).
+            assert outcome.archive_path.exists()
+            # Ledger has the success row — re-processing the same file
+            # would safely dedup via Phase 3 verification.
+            digest = ProcessedLedger.file_digest(target)
+            assert ledger.has(digest)
+            # And the operator was emailed with the cleaned PNG.
+            assert len(captured) == 1, (
+                f"expected exactly one cleanup-failure email, got {len(captured)}"
+            )
+            mail = captured[0]
+            assert mail["attachment"] is not None
+            name, payload, mime = mail["attachment"]
+            assert mime == "image/png"
+            assert name.endswith(".png")
+            assert outcome.invoice_name in mail["subject"]
+            # Body mentions the archive path so the operator knows where
+            # the canonical copy lives.
+            assert str(outcome.archive_path) in mail["body"]
+        finally:
+            target.unlink(missing_ok=True)
+            odoo.close()
+            ledger.close()
+
     def test_email_failure_keeps_file_in_inbox_no_unreadable_no_ledger(
         self, harness_inbox: Path, tmp_path: Path
     ) -> None:
