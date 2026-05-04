@@ -1880,9 +1880,19 @@ class ProcessedLedger:
         return h.hexdigest()
 
     def has(self, digest: str) -> bool:
+        """True iff the file has been *successfully* processed before.
+
+        Failure rows are kept for audit / stats but deliberately do NOT
+        gate dedup: an infra glitch (Odoo down, OCR cache unwritable,
+        etc.) must be retryable just by re-dropping the file. If the
+        operator wants to surface a permanent unreadable, they leave it
+        in ``done/unreadable/`` — they shouldn't have to perform SQL
+        surgery on the ledger to retry.
+        """
         with self._lock:
             row: tuple[Any, ...] | None = self._conn.execute(
-                "SELECT 1 FROM processed WHERE sha256 = ?", (digest,)
+                "SELECT 1 FROM processed WHERE sha256 = ? AND outcome = 'success'",
+                (digest,),
             ).fetchone()
         return row is not None
 

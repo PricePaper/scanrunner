@@ -120,11 +120,36 @@ class TestProcessedLedger:
         assert l2.has(digest)
         l2.close()
 
-    def test_failure_distinguishable_from_success(self, tmp_path: Path) -> None:
+    def test_failure_does_not_gate_dedup_so_retry_is_possible(
+        self, tmp_path: Path
+    ) -> None:
+        """`has()` is the dedup gate in Pipeline.process. Failures must
+        not lock a file out — an infra glitch (Odoo down, model cache
+        unwritable, …) should be retryable just by re-dropping the file
+        into the inbox. Operator surgery on the SQLite ledger to retry
+        a previously-failed file would be a wretched UX.
+        """
         ledger = ProcessedLedger(tmp_path / "ledger.sqlite")
         digest = "b" * 64
         ledger.record_failure(digest, "broken.jpg")
-        assert ledger.has(digest)  # failures still gate duplicates
+        assert not ledger.has(digest), (
+            "failure must not gate dedup: re-dropping the same file should retry"
+        )
+        ledger.close()
+
+    def test_success_after_failure_correctly_records_and_gates(
+        self, tmp_path: Path
+    ) -> None:
+        """Realistic recovery sequence: file fails the first attempt
+        (e.g. transient OCR cache PermissionError), operator re-drops
+        after fix, second attempt succeeds. From then on dedup gates
+        further re-drops."""
+        ledger = ProcessedLedger(tmp_path / "ledger.sqlite")
+        digest = "c" * 64
+        ledger.record_failure(digest, "scan.jpg")
+        assert not ledger.has(digest)  # retryable
+        ledger.record_success(digest, "scan.jpg", odoo_id=42, attachment_id=99)
+        assert ledger.has(digest)       # now dedup-gated
         ledger.close()
 
     def test_file_digest_is_stable(self, tmp_path: Path) -> None:
