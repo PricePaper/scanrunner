@@ -2084,9 +2084,28 @@ class Pipeline:
     def for_worker(cls, config_path: str, server_name: str, inbox: Path) -> Self:
         """Build a Pipeline inside a worker process. Reuse for every file."""
         config: Config = Config.load(config_path, server_name)
-        # cv2 thread count is per-worker. Tuned alongside `workers` so
-        # `workers * cv2_threads` stays at or below the box's core count.
-        cv2.setNumThreads(max(1, config.cv2_threads))
+        # Cap every thread pool the worker uses so `workers * cv2_threads`
+        # stays at or below the box's core count.
+        # cv2 reads its own pool size; torch ships with intra-op +
+        # inter-op pools that default to one thread per physical core
+        # (32 on a 64-core SMT host) and OpenBLAS / MKL / OpenMP under
+        # torch each spin their own. Without these caps two workers
+        # spawn >120 contending threads and stall under DocTR.
+        # Lazy import: torch is only present in environments that have
+        # the OCR backend installed; tests that don't touch the OCR
+        # path can skip it.
+        threads: int = max(1, config.cv2_threads)
+        cv2.setNumThreads(threads)
+        try:
+            import torch  # noqa: PLC0415  — defer heavy import
+            torch.set_num_threads(threads)
+            torch.set_num_interop_threads(threads)
+        except (ImportError, RuntimeError):
+            # set_num_interop_threads raises RuntimeError if the
+            # interop pool is already initialized (e.g. test re-runs in
+            # the same process). Either way, the cap above on
+            # set_num_threads still applies.
+            pass
         registry: DocumentTypeRegistry = DocumentTypeRegistry.from_config(config)
         archiver: Archiver = Archiver(inbox / config.done_path.lstrip("/"))
         ledger: ProcessedLedger = ProcessedLedger(inbox / ".processed.sqlite3")
@@ -2123,15 +2142,25 @@ class Pipeline:
         )
 
     def process(self, source: Path, *, keep_original: bool = False) -> ProcessOutcome:
-        digest: str = ProcessedLedger.file_digest(source)
-        if self._ledger.has(digest):
-            self._log.info("skip duplicate (already processed): %s", source.name)
-            return ProcessOutcome(source, True, None, None, None, None, None, None)
+        # The ledger lookup AND the file_digest call live inside the
+        # try block: an unreadable source (PermissionError, ENOENT, …)
+        # would otherwise propagate out of the worker callable into the
+        # WorkSubmitter's future, which nobody awaits, and the failure
+        # would vanish silently. Catch everything here so workers always
+        # produce a structured outcome.
+        digest: str = ""
         try:
+            digest = ProcessedLedger.file_digest(source)
+            if self._ledger.has(digest):
+                self._log.info("skip duplicate (already processed): %s", source.name)
+                return ProcessOutcome(source, True, None, None, None, None, None, None)
             return self._process_inner(source, digest, keep_original)
         except Exception as e:
             self._log.exception("unhandled error processing %s", source)
-            self._handle_failure(source, digest, error=str(e))
+            try:
+                self._handle_failure(source, digest, error=str(e))
+            except Exception:
+                self._log.exception("error handler itself failed for %s", source)
             return ProcessOutcome(
                 source, False, None, None, None, None, None, str(e)
             )

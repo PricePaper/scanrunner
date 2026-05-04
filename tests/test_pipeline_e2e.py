@@ -272,6 +272,57 @@ class TestPipelineE2E:
         odoo.close()
         ledger.close()
 
+    def test_unreadable_file_returns_failure_outcome_no_exception(
+        self, harness_inbox: Path, tmp_path: Path
+    ) -> None:
+        """A file the worker cannot read (e.g. permission-denied) must
+        yield a graceful ``ProcessOutcome(success=False, error=...)`` —
+        not an unhandled exception.
+
+        Regression: pre-fix, ``ProcessedLedger.file_digest(source)`` ran
+        BEFORE the try/except in ``Pipeline.process``, so a
+        ``PermissionError`` from the very first ``open()`` propagated
+        out of the worker callable into a future the WorkSubmitter never
+        awaited. Workers silently logged nothing while the daemon's
+        inbox sat full forever.
+        """
+        config_path = tmp_path / "config.yaml"
+        _write_test_config(config_path, harness_inbox)
+        pipeline = Pipeline.for_worker(str(config_path), "harness", harness_inbox)
+        target = harness_inbox / "Customer_Invoice-perm-denied.jpg"
+        target.write_bytes(b"\xff\xd8\xff\xe0unreadable")
+        target.chmod(0o000)
+        try:
+            outcome = pipeline.process(target)
+        finally:
+            target.chmod(0o644)
+            target.unlink(missing_ok=True)
+        assert outcome.success is False, (
+            "unreadable file should fail gracefully, not propagate an exception"
+        )
+        assert outcome.error, "failure outcome must carry a non-empty error message"
+
+    def test_pipeline_for_worker_caps_torch_thread_pool(
+        self, harness_inbox: Path, tmp_path: Path
+    ) -> None:
+        """Each worker spawns torch's intra-op pool with one thread per
+        CPU by default. On a 64-core host with two workers that's 128
+        contending threads — oversubscription that hides perf and can
+        deadlock under DocTR. ``Pipeline.for_worker`` already caps cv2;
+        it must cap torch the same way (≤ ``cv2_threads``).
+        """
+        import torch
+
+        config_path = tmp_path / "config.yaml"
+        _write_test_config(config_path, harness_inbox)
+        Pipeline.for_worker(str(config_path), "harness", harness_inbox)
+        # The harness test config sets cv2-threads=2 in _write_test_config
+        # by inheriting Config defaults; the cap should match.
+        assert torch.get_num_threads() <= 2, (
+            f"torch.get_num_threads() = {torch.get_num_threads()} > 2; "
+            "Pipeline.for_worker did not cap intra-op threads"
+        )
+
     def test_unreadable_file_routes_to_unreadable_folder(
         self, harness_inbox: Path, tmp_path: Path
     ) -> None:
