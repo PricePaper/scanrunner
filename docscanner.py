@@ -2522,8 +2522,17 @@ class Daemon:
         once.add_argument("-s", "--server", default=os.environ.get("DS_SERVER", "production"))
         once.add_argument("--keep", action="store_true", help="keep the source file after processing")
         once.add_argument("-v", "--verbose", action="store_true")
+        sub.add_parser(
+            "warm-models",
+            help=(
+                "Force-download and load the DocTR OCR predictor into the "
+                "configured DOCTR_CACHE_DIR. Used at container build time so "
+                "the first invoice in a freshly-started worker doesn't pay "
+                "the ~150 MB / 10–30 s model-download cliff."
+            ),
+        )
         ns: argparse.Namespace = parser.parse_args(argv)
-        log_level: int = logging.DEBUG if ns.verbose else logging.INFO
+        log_level: int = logging.DEBUG if getattr(ns, "verbose", False) else logging.INFO
         match ns.cmd:
             case "daemon":
                 return cls(ns.config, ns.server, ns.inbox, log_level).run()
@@ -2532,6 +2541,13 @@ class Daemon:
                 pipeline: Pipeline = Pipeline.for_worker(ns.config, ns.server, ns.inbox)
                 outcome: ProcessOutcome = pipeline.process(ns.path, keep_original=ns.keep)
                 return 0 if outcome.success else 1
+            case "warm-models":
+                logging.basicConfig(level=log_level, format=_WORKER_LOG_FORMAT)
+                _get_doctr_ocr_model()
+                logging.getLogger("scanrunner.warm").info(
+                    "DocTR OCR predictor loaded; weights cached"
+                )
+                return 0
             case other:
                 raise ValueError(f"unknown subcommand {other}")
 

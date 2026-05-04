@@ -57,14 +57,24 @@ buildah run "$ctr" -- bash -c '
   rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*
 '
 
-# 3. App + cache warm-up + perms.
+# 3. App + cache warm-up + DocTR model preload + perms.
 buildah copy --chmod 0755 "$ctr" docscanner.py /docscanner.py
 buildah run "$ctr" -- bash -c '
   set -eux
-  mkdir -p /opt/uv-cache
+  mkdir -p /opt/uv-cache /opt/doctr-cache
+  # First invocation pulls every uv-managed wheel (torch, opencv, doctr,
+  # …) into /opt/uv-cache. --help exits before any model load.
   UV_CACHE_DIR=/opt/uv-cache UV_PYTHON_PREFERENCE=only-system \
     UV_PYTHON=/usr/bin/python3.13 /docscanner.py --help >/dev/null
-  chown -R scanner:scanner /opt/uv-cache
+  # Second invocation force-loads the DocTR OCR predictor so its model
+  # weights (~150 MB) are baked into the image. Without this, the first
+  # invoice in a freshly-started container stalls 10-30 s downloading
+  # weights from S3 — a real cliff after k8s rolls or OOM restarts.
+  UV_CACHE_DIR=/opt/uv-cache UV_PYTHON_PREFERENCE=only-system \
+    UV_PYTHON=/usr/bin/python3.13 \
+    DOCTR_CACHE_DIR=/opt/doctr-cache \
+    /docscanner.py warm-models
+  chown -R scanner:scanner /opt/uv-cache /opt/doctr-cache
 '
 
 # 4. Image metadata.
@@ -74,6 +84,7 @@ buildah config \
   --env UV_CACHE_DIR=/opt/uv-cache \
   --env UV_PYTHON_PREFERENCE=only-system \
   --env UV_PYTHON=/usr/bin/python3.13 \
+  --env DOCTR_CACHE_DIR=/opt/doctr-cache \
   --env DS_CONFIG=/etc/docscanner/config.yaml \
   --env DS_SERVER=production \
   --user scanner \
