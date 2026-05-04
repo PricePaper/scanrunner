@@ -1081,6 +1081,18 @@ class StoragePreparer:
     TARGET_DPI: ClassVar[int] = 200
     DOWNSAMPLE: ClassVar[float] = TARGET_DPI / SOURCE_DPI  # 2/3
 
+    MAX_LONG_SIDE_PX: ClassVar[int] = 1920
+    """Cap the storage image's longer side at 1920 px so Odoo's default
+    ``base.image_autoresize_max_px = 1920x1920`` is a no-op on us. If we
+    exceed it Odoo silently downsamples-and-re-encodes at quality 80
+    server-side, destroying the carefully-calibrated v3 fidelity AND
+    breaking checksum-based idempotency (the stored bytes would no
+    longer match what we sent). Doing the resize ourselves with
+    INTER_AREA is higher quality than letting PIL guess on the Odoo
+    side. A typical 2538×3324 raw scan at the 2/3 DPI factor is
+    1692×2216 — already over 1920 on the long side, so this cap fires
+    on most inputs."""
+
     def __init__(
         self,
         decomposer: DocumentDecomposer | None = None,
@@ -1095,12 +1107,18 @@ class StoragePreparer:
         # decisions benefit from access to original pixel values.
         document: Document = self._decomposer.decompose(bgr)
         composite: np.ndarray = document.composite()
-        # Downsample to TARGET_DPI for storage. INTER_AREA is the
-        # right interpolation for shrink ops — it averages source
-        # pixels rather than sampling, preserving the printed/
-        # handwritten tones the layers carried through.
-        new_w: int = int(composite.shape[1] * self.DOWNSAMPLE)
-        new_h: int = int(composite.shape[0] * self.DOWNSAMPLE)
+        # Downsample to TARGET_DPI, then further if needed to fit
+        # MAX_LONG_SIDE_PX. INTER_AREA is the right interpolation for
+        # shrink ops — it averages source pixels rather than sampling,
+        # preserving the printed / handwritten tones the layers
+        # carried through.
+        h, w = composite.shape[:2]
+        factor: float = min(
+            self.DOWNSAMPLE,
+            self.MAX_LONG_SIDE_PX / max(h, w),
+        )
+        new_w: int = int(w * factor)
+        new_h: int = int(h * factor)
         downsampled: np.ndarray = cv2.resize(
             composite, (new_w, new_h), interpolation=cv2.INTER_AREA,
         )

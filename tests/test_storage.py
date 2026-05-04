@@ -105,20 +105,25 @@ class TestStoragePreparer:
             "— the layered composite left too much foreground"
         )
 
-    def test_storage_image_is_smaller_resolution_than_source(
+    def test_storage_image_long_side_caps_at_1920(
         self, first_good_invoice: Path
     ) -> None:
+        """Storage image's longer side must be ≤ 1920 px so Odoo's
+        default ``base.image_autoresize_max_px = 1920x1920`` does not
+        downsample-and-re-encode our v3 PNG server-side. See
+        StoragePreparer.MAX_LONG_SIDE_PX.
+        """
         bgr = cv2.imread(str(first_good_invoice))
         payload, _ = StoragePreparer().prepare(bgr)
         decoded = cv2.imdecode(
             np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_GRAYSCALE
         )
-        # 200/300 = 2/3 → about 4/9 the area.
         src_h, src_w = bgr.shape[:2]
         out_h, out_w = decoded.shape[:2]
         assert out_w < src_w and out_h < src_h
-        ratio = (out_w * out_h) / (src_w * src_h)
-        assert 0.40 < ratio < 0.50, f"Downsample ratio {ratio:.3f} off-target"
+        assert max(out_h, out_w) <= StoragePreparer.MAX_LONG_SIDE_PX, (
+            f"long side {max(out_h, out_w)}px exceeds Odoo's autoresize limit"
+        )
 
     def test_foreground_uses_quantized_grayscale_palette(
         self, first_good_invoice: Path
