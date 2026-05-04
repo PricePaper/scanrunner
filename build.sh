@@ -83,6 +83,10 @@ buildah config \
   --env DOCTR_CACHE_DIR=/opt/doctr-cache \
   --env DS_CONFIG=/etc/docscanner/config.yaml \
   --env DS_SERVER=production \
+  --env OMP_NUM_THREADS=2 \
+  --env MKL_NUM_THREADS=2 \
+  --env OPENBLAS_NUM_THREADS=2 \
+  --volume /opt/doctr-cache \
   --user scanner \
   --workingdir /scanner \
   --cmd '["/usr/bin/tini","--","/docscanner.py","daemon","/scanner"]' \
