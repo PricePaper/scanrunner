@@ -445,6 +445,77 @@ class TestPipelineE2E:
         finally:
             target.unlink(missing_ok=True)
 
+    def test_truncated_jpeg_left_in_inbox_no_ledger_no_unreadable(
+        self, harness_inbox: Path, tmp_path: Path
+    ) -> None:
+        """A JPEG missing its 0xFFD9 EOI trailer (most common cause:
+        the daemon raced the scanner — inotify fired before the
+        scanner finished flushing) must NOT be processed. Pre-flight
+        EOI check should detect it, log a warning, and leave the file
+        in the inbox so the periodic sweep retries it once the
+        scanner finishes the write. No ledger row, no done/unreadable/
+        — the file isn't permanently broken, it's just incomplete."""
+        config_path = tmp_path / "config.yaml"
+        _write_test_config(config_path, harness_inbox)
+        pipeline = Pipeline.for_worker(str(config_path), "harness", harness_inbox)
+
+        # Take a real JPEG, truncate the last 32 bytes (well past the
+        # EOI marker which is at the very end). cv2 may still decode
+        # most of it; without our pre-flight check we'd attach garbage
+        # to Odoo on the OCR-success path.
+        src = next(
+            (Path("/home/ejprice/PycharmProjects/scanrunner/corpus/invoices/good")
+             .glob("INV-2026-05000_*.jpg")),
+            None,
+        )
+        if src is None:
+            pytest.skip("no INV-2026-05000 corpus sample available")
+        target = harness_inbox / "Customer_Invoice-truncated.jpg"
+        original_bytes = src.read_bytes()
+        target.write_bytes(original_bytes[:-32])  # chop the EOI
+
+        try:
+            outcome = pipeline.process(target)
+            assert outcome.success is False, (
+                "truncated JPEG must not be treated as success"
+            )
+            assert outcome.error and "truncat" in outcome.error.lower()
+            # Source still in inbox for sweep retry.
+            assert target.exists()
+            # Not in done/unreadable/ — this is transient, not permanent.
+            unreadable = harness_inbox / "done" / "unreadable" / target.name
+            assert not unreadable.exists()
+        finally:
+            target.unlink(missing_ok=True)
+
+    def test_complete_jpeg_processes_normally(
+        self, harness_inbox: Path, tmp_path: Path
+    ) -> None:
+        """The pre-flight EOI check must not regress the happy path —
+        a fully-written JPEG with intact 0xFFD9 still processes
+        end-to-end."""
+        config_path = tmp_path / "config.yaml"
+        _write_test_config(config_path, harness_inbox)
+        pipeline = Pipeline.for_worker(str(config_path), "harness", harness_inbox)
+
+        src = next(
+            (Path("/home/ejprice/PycharmProjects/scanrunner/corpus/invoices/good")
+             .glob("INV-2026-05002_*.jpg")),
+            None,
+        )
+        if src is None:
+            pytest.skip("no corpus invoice available")
+        target = harness_inbox / "Customer_Invoice-complete-jpeg.jpg"
+        target.write_bytes(src.read_bytes())  # untouched
+        try:
+            outcome = pipeline.process(target)
+            assert outcome.success is True, (
+                f"complete JPEG must process normally, got: {outcome.error}"
+            )
+            assert outcome.attachment_id is not None
+        finally:
+            target.unlink(missing_ok=True)
+
     def test_unlink_failure_emails_operator_and_preserves_outcome(
         self, harness_inbox: Path, tmp_path: Path
     ) -> None:
@@ -726,6 +797,113 @@ def _capture_worker_logging_state() -> dict:
             logging.getLogger("httpx").getEffectiveLevel()
         ),
     }
+
+
+class TestJpegEoiPreflight:
+    def test_complete_jpeg_returns_true(self, tmp_path: Path) -> None:
+        from docscanner import _is_complete_jpeg
+        path = tmp_path / "good.jpg"
+        path.write_bytes(b"\xff\xd8\xff\xe0fake jpeg payload\xff\xd9")
+        assert _is_complete_jpeg(path) is True
+
+    def test_truncated_jpeg_returns_false(self, tmp_path: Path) -> None:
+        from docscanner import _is_complete_jpeg
+        path = tmp_path / "truncated.jpg"
+        path.write_bytes(b"\xff\xd8\xff\xe0fake jpeg payload but no eoi")
+        assert _is_complete_jpeg(path) is False
+
+    def test_empty_file_returns_false(self, tmp_path: Path) -> None:
+        from docscanner import _is_complete_jpeg
+        path = tmp_path / "empty.jpg"
+        path.write_bytes(b"")
+        assert _is_complete_jpeg(path) is False
+
+    def test_one_byte_file_returns_false(self, tmp_path: Path) -> None:
+        from docscanner import _is_complete_jpeg
+        path = tmp_path / "tiny.jpg"
+        path.write_bytes(b"\xff")
+        assert _is_complete_jpeg(path) is False
+
+    def test_non_jpeg_extension_short_circuits_to_true(
+        self, tmp_path: Path
+    ) -> None:
+        """The pre-flight is a JPEG-specific check. PNG / PDF files
+        have their own integrity surfaces (PNG IEND chunk, PDF %%EOF),
+        but cv2.imread on those paths handles them differently and
+        the EOI marker is meaningless. The helper must return True
+        for non-JPEGs so they fall through to normal processing."""
+        from docscanner import _is_complete_jpeg
+        png = tmp_path / "scan.png"
+        png.write_bytes(b"\x89PNG\r\n\x1a\n short truncated png")  # no IEND
+        assert _is_complete_jpeg(png) is True
+        pdf = tmp_path / "scan.pdf"
+        pdf.write_bytes(b"%PDF-1.4 short")
+        assert _is_complete_jpeg(pdf) is True
+
+
+class TestPeriodicSweepLoop:
+    def test_invokes_callback_repeatedly_until_stop_event(self) -> None:
+        """The sweep loop calls its callback every ``interval`` seconds
+        and stops promptly when the stop event fires. Used by the
+        Daemon to re-fire ``watcher.initial_sweep`` periodically so
+        files left in the inbox by transient failures (truncated
+        JPEG mid-write, infra-failure catchall) eventually retry
+        without operator action."""
+        import threading
+        import time
+        from docscanner import _periodic_sweep_loop
+
+        calls: list[float] = []
+
+        def cb() -> None:
+            calls.append(time.monotonic())
+
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=_periodic_sweep_loop,
+            args=(cb, 0.1, stop),
+            daemon=True,
+        )
+        thread.start()
+        time.sleep(0.45)  # ~4 ticks
+        stop.set()
+        thread.join(timeout=2.0)
+        assert not thread.is_alive(), "sweep thread did not stop on event"
+        # Allow some scheduling jitter — at 0.1s intervals over 0.45s
+        # we expect 3-5 calls. Anything in that range proves both that
+        # the loop ticks AND that it stops promptly.
+        assert 3 <= len(calls) <= 5, (
+            f"expected 3-5 ticks at 0.1s intervals, got {len(calls)}"
+        )
+
+    def test_callback_exception_does_not_kill_loop(self) -> None:
+        """A failure inside the callback must not crash the timer
+        thread — otherwise one bad sweep stops all future retries
+        and the inbox silently piles up."""
+        import threading
+        import time
+        from docscanner import _periodic_sweep_loop
+
+        attempts: list[int] = []
+
+        def cb() -> None:
+            attempts.append(len(attempts))
+            raise RuntimeError(f"sweep #{len(attempts)} blew up")
+
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=_periodic_sweep_loop,
+            args=(cb, 0.1, stop),
+            daemon=True,
+        )
+        thread.start()
+        time.sleep(0.35)
+        stop.set()
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+        assert len(attempts) >= 2, (
+            "loop did not survive callback exception"
+        )
 
 
 class TestWorkerLogging:

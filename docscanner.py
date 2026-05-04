@@ -1245,6 +1245,16 @@ class Config:
         # genuinely bursty.
         self.workers: int = int(raw.get("workers", 2))
         self.cv2_threads: int = int(raw.get("cv2-threads", 2))
+        # Periodic sweep cadence. Re-runs FileWatcher.initial_sweep at
+        # this interval so files left in the inbox by transient
+        # failures (truncated JPEG mid-write, infra catchall, NFS
+        # blip) eventually retry without operator action. Set to 0
+        # to disable. Default 60s — fast enough that a stuck file
+        # recovers within the operator's attention span, slow enough
+        # that the inflight-dedup overhead is negligible.
+        self.periodic_sweep_seconds: float = float(
+            raw.get("periodic-sweep-seconds", 60)
+        )
         self.documents: dict[str, DocumentTypeConfig] = {}
         for name, doc in (raw.get("documents") or {}).items():
             try:
@@ -2454,7 +2464,26 @@ class Pipeline:
                 "no matching document type",
             )
 
-        # 2. Read + per-type preprocess
+        # 2. Read + per-type preprocess.
+        # Pre-flight: if it's a JPEG, confirm the 0xFFD9 EOI marker is
+        # present. The most common cause of a truncated JPEG is the
+        # daemon racing the scanner — inotify on_closed fired but the
+        # OS hasn't flushed the tail bytes yet (NFS / scanner buffering /
+        # multi-page incremental writes). Bail out without recording a
+        # ledger row or moving the file: the periodic sweep will retry
+        # once the scanner finishes flushing. The libjpeg "Premature end
+        # of JPEG file" warning that cv2 prints to stderr would otherwise
+        # leave us with partial pixel data we'd happily attach to Odoo.
+        if not _is_complete_jpeg(source):
+            self._log.warning(
+                "%s appears truncated (missing JPEG EOI) — leaving in "
+                "inbox; periodic sweep will retry",
+                source.name,
+            )
+            return ProcessOutcome(
+                source, False, None, None, None, None, None,
+                "truncated JPEG (will retry)",
+            )
         bgr: BgrImage | None = cv2.imread(str(source))
         if bgr is None:
             self._handle_failure(source, digest, "cv2 could not read file")
@@ -2745,6 +2774,62 @@ _WORKER_LOG_FORMAT: str = (
 )
 
 
+_JPEG_SUFFIXES: frozenset[str] = frozenset({".jpg", ".jpeg"})
+
+
+def _is_complete_jpeg(path: Path) -> bool:
+    """True if ``path`` either isn't a JPEG (suffix-based, .png / .pdf
+    fall through to True) or is a JPEG that ends with the 0xFFD9 EOI
+    marker. False for truncated JPEGs and unreadable files.
+
+    Used as a pre-flight check in ``Pipeline._process_inner`` so a
+    daemon that races the scanner — the inotify ``on_closed`` event
+    fires but the file's tail bytes haven't been flushed yet — bails
+    out cleanly instead of feeding cv2 a partial buffer that decodes
+    into pixel garbage and then attaches that garbage to Odoo.
+    """
+    if path.suffix.lower() not in _JPEG_SUFFIXES:
+        return True
+    try:
+        with open(path, "rb") as f:
+            try:
+                f.seek(-2, os.SEEK_END)
+            except OSError:
+                # Files smaller than 2 bytes can't have an EOI marker.
+                return False
+            tail: bytes = f.read(2)
+    except OSError:
+        return False
+    return tail == b"\xff\xd9"
+
+
+def _periodic_sweep_loop(
+    callback: Any,
+    interval_seconds: float,
+    stop_event: threading.Event,
+) -> None:
+    """Daemon helper: invoke ``callback()`` every ``interval_seconds``
+    until ``stop_event`` is set. Catches and logs exceptions from the
+    callback so a single failed sweep doesn't kill the timer thread —
+    a stuck inbox is much worse than a noisy log line.
+
+    Used by ``Daemon`` to periodically re-fire
+    ``FileWatcher.initial_sweep`` so files left in the inbox by
+    transient failures (truncated JPEG mid-write, infra catchall, NFS
+    glitch) eventually retry without operator action. The
+    ``WorkSubmitter._inflight`` set dedupes against work currently in
+    flight, so re-submitting an in-flight file is a cheap no-op.
+    """
+    log: logging.Logger = logging.getLogger("scanrunner.sweep")
+    while not stop_event.is_set():
+        if stop_event.wait(interval_seconds):
+            return
+        try:
+            callback()
+        except Exception:
+            log.exception("periodic sweep callback raised — continuing")
+
+
 def _worker_init_logging() -> None:
     """ProcessPoolExecutor initializer: configure stderr logging.
 
@@ -2922,6 +3007,8 @@ class Daemon:
         )
         self._watcher: FileWatcher = FileWatcher(self._inbox, self._submitter)
         self._stop: threading.Event = threading.Event()
+        self._periodic_sweep_seconds: float = config.periodic_sweep_seconds
+        self._sweep_thread: threading.Thread | None = None
         signal.signal(signal.SIGTERM, self._signal)
         signal.signal(signal.SIGINT, self._signal)
 
@@ -2931,18 +3018,37 @@ class Daemon:
 
     def run(self) -> int:
         self._log.info(
-            "starting watcher on %s with %d worker(s)",
+            "starting watcher on %s with %d worker(s); periodic sweep "
+            "every %.0fs",
             self._inbox,
             self._submitter.max_workers,
+            self._periodic_sweep_seconds,
         )
         self._watcher.start()
+        # Start the periodic sweep AFTER the initial inbox sweep so we
+        # don't double-submit on startup. WorkSubmitter._inflight will
+        # dedupe in any case, but starting cleanly is friendlier.
         try:
             n: int = self._watcher.initial_sweep()
             self._log.info("initial sweep submitted %d file(s)", n)
+            if self._periodic_sweep_seconds > 0:
+                self._sweep_thread = threading.Thread(
+                    target=_periodic_sweep_loop,
+                    args=(
+                        self._watcher.initial_sweep,
+                        self._periodic_sweep_seconds,
+                        self._stop,
+                    ),
+                    name="scanrunner-periodic-sweep",
+                    daemon=True,
+                )
+                self._sweep_thread.start()
             self._stop.wait()
         finally:
             self._log.info("stopping watcher and draining workers")
             self._watcher.stop()
+            if self._sweep_thread is not None:
+                self._sweep_thread.join(timeout=5.0)
             self._submitter.shutdown(wait=True)
         return 0
 
