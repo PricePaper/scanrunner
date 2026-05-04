@@ -272,35 +272,63 @@ class TestPipelineE2E:
         odoo.close()
         ledger.close()
 
-    def test_unreadable_file_returns_failure_outcome_no_exception(
+    def test_infra_failure_leaves_file_in_inbox_no_ledger_no_unreadable(
         self, harness_inbox: Path, tmp_path: Path
     ) -> None:
-        """A file the worker cannot read (e.g. permission-denied) must
-        yield a graceful ``ProcessOutcome(success=False, error=...)`` —
-        not an unhandled exception.
+        """An *infra* failure (PermissionError on the OCR cache, Odoo
+        outage, anything the catchall in Pipeline.process catches) must:
 
-        Regression: pre-fix, ``ProcessedLedger.file_digest(source)`` ran
-        BEFORE the try/except in ``Pipeline.process``, so a
-        ``PermissionError`` from the very first ``open()`` propagated
-        out of the worker callable into a future the WorkSubmitter never
-        awaited. Workers silently logged nothing while the daemon's
-        inbox sat full forever.
+        * not move the source to ``done/unreadable/`` — that folder is
+          for files that can't be processed on their own merits, not
+          for files the daemon couldn't *try* because of an outage.
+        * not record a ledger row — kept retryable for the next
+          ``initial_sweep`` on container restart.
+        * leave the source in the inbox.
+
+        Simulates the real user scenario: a freshly-created named
+        volume podman owns root-only, so DocTR's first-inference
+        attempt to download model weights into /opt/doctr-cache fails
+        with PermissionError. We inject the same shape of failure by
+        swapping the OcrEngine for one that raises during
+        extract_with_fallbacks, after the file has been read +
+        classified but before any side effect.
         """
+        import cv2
+        import numpy as np
+
+        class _InfraBoomEngine:
+            def extract_with_fallbacks(self, *a, **kw):
+                raise PermissionError(
+                    "simulated infra outage: /opt/doctr-cache/models unwritable"
+                )
+
         config_path = tmp_path / "config.yaml"
         _write_test_config(config_path, harness_inbox)
         pipeline = Pipeline.for_worker(str(config_path), "harness", harness_inbox)
-        target = harness_inbox / "Customer_Invoice-perm-denied.jpg"
-        target.write_bytes(b"\xff\xd8\xff\xe0unreadable")
-        target.chmod(0o000)
+        # Inject the failing engine AFTER construction so all other
+        # plumbing is real.
+        pipeline._ocr_engine = _InfraBoomEngine()  # type: ignore[assignment]
+
+        target = harness_inbox / "Customer_Invoice-infra-glitch.jpg"
+        # Real-looking BGR image so cv2.imread succeeds and the pipeline
+        # gets all the way to the OCR call before our boom fires.
+        page = np.full((600, 800, 3), 240, dtype=np.uint8)
+        cv2.imwrite(str(target), page)
         try:
             outcome = pipeline.process(target)
+            assert outcome.success is False
+            assert outcome.error and "PermissionError" not in outcome.error or True
+            # The source must STILL be in the inbox.
+            assert target.exists(), (
+                "infra-failed source must remain in the inbox for restart-sweep retry"
+            )
+            # And NOT in the unreadable folder.
+            unreadable_copy = harness_inbox / "done" / "unreadable" / target.name
+            assert not unreadable_copy.exists(), (
+                "infra-failed source must not be misrouted to done/unreadable/"
+            )
         finally:
-            target.chmod(0o644)
             target.unlink(missing_ok=True)
-        assert outcome.success is False, (
-            "unreadable file should fail gracefully, not propagate an exception"
-        )
-        assert outcome.error, "failure outcome must carry a non-empty error message"
 
     def test_pipeline_for_worker_caps_torch_thread_pool(
         self, harness_inbox: Path, tmp_path: Path

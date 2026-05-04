@@ -2166,11 +2166,19 @@ class Pipeline:
                 return ProcessOutcome(source, True, None, None, None, None, None, None)
             return self._process_inner(source, digest, keep_original)
         except Exception as e:
-            self._log.exception("unhandled error processing %s", source)
-            try:
-                self._handle_failure(source, digest, error=str(e))
-            except Exception:
-                self._log.exception("error handler itself failed for %s", source)
+            # Catchall = infra failure (network, cache permission, …).
+            # The file's own readability / classifiability / OCR success
+            # all run inside _process_inner, which calls _handle_failure
+            # itself for those file-specific cases (and routes to
+            # done/unreadable/). What lands here is "the daemon couldn't
+            # try" — leave the file in the inbox so the next
+            # initial_sweep on container restart retries it after the
+            # operator fixes the underlying issue. No ledger row, no
+            # unreadable move, no email storm.
+            self._log.exception(
+                "infra failure processing %s — leaving in inbox for retry",
+                source,
+            )
             return ProcessOutcome(
                 source, False, None, None, None, None, None, str(e)
             )
