@@ -38,7 +38,7 @@ buildah run "$ctr" -- bash -c '
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y --no-install-recommends \
-      tini python3 tesseract-ocr libmagic1 libgl1 libglib2.0-0 \
+      tini python3 libmagic1 libgl1 libglib2.0-0 \
       ca-certificates curl
   groupadd --gid 1001 scanner
   useradd --uid 1001 --gid 1001 --shell /usr/sbin/nologin -d /scanner -m scanner
@@ -81,7 +81,7 @@ buildah config \
   --cmd '["/usr/bin/tini","--","/docscanner.py","daemon","/scanner"]' \
   --label "maintainer=Ean J Price <ean@pricepaper.com>" \
   --label "org.opencontainers.image.title=scanrunner" \
-  --label "org.opencontainers.image.description=Invoice scan ingest daemon (clean-room v2.0)." \
+  --label "org.opencontainers.image.description=Invoice scan ingest daemon (DocTR + layered v3)." \
   --label "org.opencontainers.image.version=2-${BUILD_DATE}" \
   --label "org.opencontainers.image.source=https://github.com/PricePaper/scanrunner" \
   "$ctr"
