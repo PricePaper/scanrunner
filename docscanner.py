@@ -11,7 +11,23 @@
 #   "httpx[http2]>=0.27",
 #   "python-doctr>=1.0",
 #   "torch>=2.4",
+#   "torchvision>=0.19",
 # ]
+#
+# # Pin torch + torchvision to the CPU-only wheel index. The default PyPI
+# # wheels carry a CUDA build that drags in nvidia_* runtime libs (cuBLAS,
+# # cuDNN, cuFFT, NCCL, etc.) totalling ~3 GB. We run inference on CPU
+# # only — DocTR + CRNN at ~5-15 s/page is fine — so the CUDA libs are
+# # pure dead weight in the container image. `explicit = true` keeps the
+# # CPU index from intercepting unrelated packages (numpy, doctr, etc.).
+# [tool.uv.sources]
+# torch = [{ index = "pytorch-cpu" }]
+# torchvision = [{ index = "pytorch-cpu" }]
+#
+# [[tool.uv.index]]
+# name = "pytorch-cpu"
+# url = "https://download.pytorch.org/whl/cpu"
+# explicit = true
 # ///
 """scanrunner v2.0 — clean-room rewrite.
 
