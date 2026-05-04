@@ -1680,6 +1680,72 @@ class OdooClient:
         )
         return int(attachment_id)
 
+    def find_attachment_by_checksum(
+        self,
+        record_model: str,
+        record_id: int,
+        checksum: str,
+    ) -> int | None:
+        """Phase-2 idempotency primitive.
+
+        Returns the id of an existing ``ir.attachment`` on this record
+        whose sha1 checksum (Odoo's own ``checksum`` field) matches the
+        bytes the caller is about to upload — or None. Lets
+        Pipeline.process skip a redundant ``attach()`` call when a
+        previous attempt uploaded but crashed before the local ledger
+        recorded success.
+
+        Scope is intentionally per-record so a checksum collision on a
+        different invoice doesn't make us treat it as already-uploaded.
+        """
+        rows: list[dict[str, Any]] = self.search_read(
+            "ir.attachment",
+            [
+                ["res_model", "=", record_model],
+                ["res_id", "=", record_id],
+                ["checksum", "=", checksum],
+            ],
+            ["id"],
+            limit=1,
+        )
+        return int(rows[0]["id"]) if rows else None
+
+    def verify_attachment(
+        self,
+        attachment_id: int,
+        expected_res_model: str,
+        expected_res_id: int,
+        expected_name_contains: str,
+    ) -> bool:
+        """Phase-3 duplicate-handling primitive.
+
+        Returns True iff the ``ir.attachment`` row with ``attachment_id``
+        is still present AND attached to ``(expected_res_model,
+        expected_res_id)`` AND its ``name`` field still contains
+        ``expected_name_contains`` (typically the OCR'd invoice slug
+        like ``"INV-2026-05001"``). Operator-edited names that lose
+        the slug surface as False so we re-upload defensively.
+
+        Transport errors are deliberately NOT swallowed — they
+        propagate so ``Pipeline.process``'s catchall leaves the file
+        in the inbox for retry rather than treating an Odoo outage as
+        "attachment is gone".
+        """
+        rows: list[dict[str, Any]] = self.search_read(
+            "ir.attachment",
+            [["id", "=", attachment_id]],
+            ["res_model", "res_id", "name"],
+            limit=1,
+        )
+        if not rows:
+            return False
+        row: dict[str, Any] = rows[0]
+        return (
+            row.get("res_model") == expected_res_model
+            and int(row.get("res_id") or 0) == expected_res_id
+            and expected_name_contains in (row.get("name") or "")
+        )
+
     def link_to_documents_app(
         self,
         attachment_id: int,
@@ -1857,9 +1923,21 @@ class ProcessedLedger:
             outcome TEXT NOT NULL,
             odoo_id INTEGER,
             attachment_id INTEGER,
-            recorded_at REAL NOT NULL
+            recorded_at REAL NOT NULL,
+            res_model TEXT NOT NULL DEFAULT '',
+            ocr_name TEXT NOT NULL DEFAULT '',
+            archive_path TEXT NOT NULL DEFAULT ''
         )
     """
+
+    # Phase-2 columns (added to support verified-duplicate handling) are
+    # appended via ALTER TABLE on existing databases so a pre-Phase-2
+    # ledger keeps loading without manual migration.
+    _PHASE2_COLUMNS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("res_model",    "TEXT NOT NULL DEFAULT ''"),
+        ("ocr_name",     "TEXT NOT NULL DEFAULT ''"),
+        ("archive_path", "TEXT NOT NULL DEFAULT ''"),
+    )
 
     def __init__(self, path: Path) -> None:
         self._path: Path = Path(path)
@@ -1869,6 +1947,17 @@ class ProcessedLedger:
             self._path, check_same_thread=False
         )
         self._conn.execute(self.SCHEMA)
+        # Backfill columns introduced by Phase 2 onto pre-existing rows.
+        existing_cols: set[str] = {
+            row[1] for row in self._conn.execute(
+                "PRAGMA table_info(processed)"
+            ).fetchall()
+        }
+        for col_name, col_def in self._PHASE2_COLUMNS:
+            if col_name not in existing_cols:
+                self._conn.execute(
+                    f"ALTER TABLE processed ADD COLUMN {col_name} {col_def}"
+                )
         self._conn.commit()
 
     @staticmethod
@@ -1897,12 +1986,67 @@ class ProcessedLedger:
         return row is not None
 
     def record_success(
-        self, digest: str, source_name: str, odoo_id: int, attachment_id: int
+        self,
+        digest: str,
+        source_name: str,
+        odoo_id: int,
+        attachment_id: int,
+        *,
+        res_model: str,
+        ocr_name: str,
+        archive_path: Path,
     ) -> None:
-        self._upsert(digest, source_name, "success", odoo_id, attachment_id)
+        """Record a successful processing outcome.
+
+        ``res_model``, ``ocr_name``, and ``archive_path`` are persisted so
+        that Phase-3 duplicate verification can confirm an Odoo
+        attachment is still attached to the right record without having
+        to re-OCR the source file.
+        """
+        self._upsert(
+            digest, source_name, "success", odoo_id, attachment_id,
+            res_model=res_model, ocr_name=ocr_name,
+            archive_path=str(archive_path),
+        )
 
     def record_failure(self, digest: str, source_name: str) -> None:
-        self._upsert(digest, source_name, "failure", None, None)
+        self._upsert(
+            digest, source_name, "failure", None, None,
+            res_model="", ocr_name="", archive_path="",
+        )
+
+    def get_success_row(self, digest: str) -> "ProcessedRow | None":
+        """Read the success row for ``digest`` (or None for failure /
+        missing). Returns the typed view Phase-3 verification needs."""
+        with self._lock:
+            row: tuple[Any, ...] | None = self._conn.execute(
+                """
+                SELECT odoo_id, attachment_id, res_model, ocr_name, archive_path
+                FROM processed
+                WHERE sha256 = ? AND outcome = 'success'
+                """,
+                (digest,),
+            ).fetchone()
+        if row is None:
+            return None
+        odoo_id, attachment_id, res_model, ocr_name, archive_path = row
+        return ProcessedRow(
+            odoo_id=int(odoo_id),
+            attachment_id=int(attachment_id),
+            res_model=res_model or "",
+            ocr_name=ocr_name or "",
+            archive_path=Path(archive_path) if archive_path else Path(),
+        )
+
+    def delete(self, digest: str) -> None:
+        """Remove the row for ``digest``. Used by Phase-3 when Odoo
+        verification reports the attachment is gone — the next
+        ``Pipeline.process`` call must reprocess from scratch."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM processed WHERE sha256 = ?", (digest,),
+            )
+            self._conn.commit()
 
     def _upsert(
         self,
@@ -1911,25 +2055,52 @@ class ProcessedLedger:
         outcome: str,
         odoo_id: int | None,
         attachment_id: int | None,
+        *,
+        res_model: str,
+        ocr_name: str,
+        archive_path: str,
     ) -> None:
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO processed (sha256, source_name, outcome, odoo_id, attachment_id, recorded_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO processed (
+                    sha256, source_name, outcome, odoo_id, attachment_id,
+                    recorded_at, res_model, ocr_name, archive_path
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sha256) DO UPDATE SET
                     outcome = excluded.outcome,
                     odoo_id = excluded.odoo_id,
                     attachment_id = excluded.attachment_id,
-                    recorded_at = excluded.recorded_at
+                    recorded_at = excluded.recorded_at,
+                    res_model = excluded.res_model,
+                    ocr_name = excluded.ocr_name,
+                    archive_path = excluded.archive_path
                 """,
-                (digest, source_name, outcome, odoo_id, attachment_id, time.time()),
+                (
+                    digest, source_name, outcome, odoo_id, attachment_id,
+                    time.time(), res_model, ocr_name, archive_path,
+                ),
             )
             self._conn.commit()
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessedRow:
+    """Typed view of a ``ProcessedLedger`` success row, produced by
+    :meth:`ProcessedLedger.get_success_row`. The ``res_model``,
+    ``ocr_name``, and ``archive_path`` fields are empty / Path() for
+    rows written before the Phase-2 schema bump."""
+
+    odoo_id: int
+    attachment_id: int
+    res_model: str
+    ocr_name: str
+    archive_path: Path
 
 
 # -----------------------------------------------------------------------------
@@ -2257,19 +2428,35 @@ class Pipeline:
         mime: str
         payload, mime = self._storage_preparer.prepare(bgr)
 
-        # 6. Odoo attach + link
-        attachment_id: int = self._odoo.attach(
-            doc_type.config.odoo_object,
-            odoo_id,
-            self._attachment_filename(ocr.name, source.name, mime),
-            mime,
-            payload,
+        # 6. Odoo attach + link.
+        # Idempotency check: if a previous attempt uploaded this exact
+        # payload and crashed before record_success, Odoo already has
+        # the attachment under the same checksum. Reuse the existing
+        # aid instead of creating a duplicate.
+        payload_sha1: str = hashlib.sha1(payload).hexdigest()
+        existing_aid: int | None = self._odoo.find_attachment_by_checksum(
+            doc_type.config.odoo_object, odoo_id, payload_sha1,
         )
-        self._odoo.link_to_documents_app(
-            attachment_id=attachment_id,
-            folder_id=doc_type.config.odoo_folder_id,
-            tag_id=doc_type.config.odoo_attachment_tag_id,
-        )
+        attachment_id: int
+        if existing_aid is not None:
+            self._log.info(
+                "Odoo already has attachment %s for %s (checksum %s) — reusing",
+                existing_aid, source.name, payload_sha1[:12],
+            )
+            attachment_id = existing_aid
+        else:
+            attachment_id = self._odoo.attach(
+                doc_type.config.odoo_object,
+                odoo_id,
+                self._attachment_filename(ocr.name, source.name, mime),
+                mime,
+                payload,
+            )
+            self._odoo.link_to_documents_app(
+                attachment_id=attachment_id,
+                folder_id=doc_type.config.odoo_folder_id,
+                tag_id=doc_type.config.odoo_attachment_tag_id,
+            )
 
         # 7. Archive
         ext: str = "jpg" if mime == "image/jpeg" else "png"
@@ -2279,7 +2466,12 @@ class Pipeline:
         )
 
         # 8. Ledger + stats + cleanup
-        self._ledger.record_success(digest, source.name, odoo_id, attachment_id)
+        self._ledger.record_success(
+            digest, source.name, odoo_id, attachment_id,
+            res_model=doc_type.config.odoo_object,
+            ocr_name=ocr.name,
+            archive_path=archive_path,
+        )
         self._stats.record(doc_type.name, ocr.region)
         if not keep_original:
             try:

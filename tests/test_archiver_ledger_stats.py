@@ -106,7 +106,11 @@ class TestProcessedLedger:
         ledger = ProcessedLedger(tmp_path / "ledger.sqlite")
         digest = "deadbeef" * 8
         assert not ledger.has(digest)
-        ledger.record_success(digest, "src.jpg", odoo_id=42, attachment_id=99)
+        ledger.record_success(
+            digest, "src.jpg", odoo_id=42, attachment_id=99,
+            res_model="account.move", ocr_name="INV/2026/00001",
+            archive_path=tmp_path / "done.png",
+        )
         assert ledger.has(digest)
         ledger.close()
 
@@ -114,7 +118,11 @@ class TestProcessedLedger:
         path = tmp_path / "ledger.sqlite"
         l1 = ProcessedLedger(path)
         digest = "a" * 64
-        l1.record_success(digest, "src.jpg", 1, 2)
+        l1.record_success(
+            digest, "src.jpg", 1, 2,
+            res_model="account.move", ocr_name="INV/2026/00001",
+            archive_path=path.parent / "done.png",
+        )
         l1.close()
         l2 = ProcessedLedger(path)
         assert l2.has(digest)
@@ -137,6 +145,99 @@ class TestProcessedLedger:
         )
         ledger.close()
 
+    def test_record_success_persists_res_model_ocr_name_archive_path(
+        self, tmp_path: Path
+    ) -> None:
+        """Ledger persists everything Phase-3 verification needs to
+        confirm a duplicate is really attached to the right Odoo
+        record without having to re-OCR."""
+        ledger = ProcessedLedger(tmp_path / "ledger.sqlite")
+        digest = "d" * 64
+        ledger.record_success(
+            digest,
+            source_name="Customer_Invoice-foo.jpg",
+            odoo_id=42,
+            attachment_id=99,
+            res_model="account.move",
+            ocr_name="INV/2026/05001",
+            archive_path=tmp_path / "done" / "INV" / "2026" / "05000" / "x.png",
+        )
+        row = ledger.get_success_row(digest)
+        assert row is not None
+        assert row.odoo_id == 42
+        assert row.attachment_id == 99
+        assert row.res_model == "account.move"
+        assert row.ocr_name == "INV/2026/05001"
+        assert str(row.archive_path).endswith("x.png")
+        ledger.close()
+
+    def test_get_success_row_returns_none_for_failure_or_missing(
+        self, tmp_path: Path
+    ) -> None:
+        ledger = ProcessedLedger(tmp_path / "ledger.sqlite")
+        # Failure row exists but is not a success → get_success_row None.
+        ledger.record_failure("e" * 64, "broken.jpg")
+        assert ledger.get_success_row("e" * 64) is None
+        # Never-seen digest → None.
+        assert ledger.get_success_row("f" * 64) is None
+        ledger.close()
+
+    def test_delete_removes_row_and_re_enables_processing(
+        self, tmp_path: Path
+    ) -> None:
+        ledger = ProcessedLedger(tmp_path / "ledger.sqlite")
+        digest = "g" * 64
+        ledger.record_success(
+            digest, "x.jpg", odoo_id=1, attachment_id=1,
+            res_model="account.move", ocr_name="INV/2026/00001",
+            archive_path=tmp_path / "x.png",
+        )
+        assert ledger.has(digest)
+        ledger.delete(digest)
+        assert not ledger.has(digest)
+        assert ledger.get_success_row(digest) is None
+        ledger.close()
+
+    def test_existing_row_without_phase2_columns_is_readable(
+        self, tmp_path: Path
+    ) -> None:
+        """Schema migration safety: a ledger written by a pre-Phase-2
+        binary (no res_model / ocr_name / archive_path columns) must
+        still load without error. Older rows surface as success rows
+        with empty strings for the new fields — Phase 3's verify
+        treats those as "can't confirm" → reprocess (Phase 2's
+        idempotency catches the redundant upload)."""
+        # Simulate an old ledger by creating just the original schema.
+        import sqlite3
+        path = tmp_path / "legacy.sqlite"
+        conn = sqlite3.connect(path)
+        conn.execute(
+            """CREATE TABLE processed (
+                sha256 TEXT PRIMARY KEY,
+                source_name TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                odoo_id INTEGER,
+                attachment_id INTEGER,
+                recorded_at REAL NOT NULL
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO processed VALUES (?, ?, ?, ?, ?, ?)",
+            ("h" * 64, "old.jpg", "success", 1, 2, 0.0),
+        )
+        conn.commit()
+        conn.close()
+        # Now open with the new code; migration should run silently.
+        ledger = ProcessedLedger(path)
+        assert ledger.has("h" * 64)
+        row = ledger.get_success_row("h" * 64)
+        assert row is not None
+        assert row.odoo_id == 1
+        assert row.attachment_id == 2
+        assert row.res_model == ""
+        assert row.ocr_name == ""
+        ledger.close()
+
     def test_success_after_failure_correctly_records_and_gates(
         self, tmp_path: Path
     ) -> None:
@@ -148,7 +249,11 @@ class TestProcessedLedger:
         digest = "c" * 64
         ledger.record_failure(digest, "scan.jpg")
         assert not ledger.has(digest)  # retryable
-        ledger.record_success(digest, "scan.jpg", odoo_id=42, attachment_id=99)
+        ledger.record_success(
+            digest, "scan.jpg", odoo_id=42, attachment_id=99,
+            res_model="account.move", ocr_name="INV/2026/00042",
+            archive_path=tmp_path / "x.png",
+        )
         assert ledger.has(digest)       # now dedup-gated
         ledger.close()
 

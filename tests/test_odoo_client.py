@@ -168,6 +168,92 @@ class TestOdooClientAttachAndLink:
         assert document_id > 0
 
 
+class TestOdooClientIdempotencyAndVerify:
+    def test_find_attachment_by_checksum_matches_recent_upload(
+        self, harness_client: OdooClient
+    ) -> None:
+        """find_attachment_by_checksum returns the aid of an existing
+        ir.attachment on the SAME (res_model, res_id) whose sha1
+        checksum matches the bytes the caller is about to upload.
+        Lets Pipeline.process skip a redundant create_attachment when
+        a previous attempt already uploaded but crashed before
+        recording success in the local ledger.
+        """
+        import hashlib
+        rows = harness_client.search_read(
+            "account.move", [["name", "like", "INV/2026"]], ["id", "name"], limit=1
+        )
+        invoice_id = int(rows[0]["id"])
+        payload = b"\xff\xd8\xff\xe0idempotency-fixture"
+        aid = harness_client.attach(
+            "account.move", invoice_id,
+            "INV-2026-idem-test.jpg", "image/jpeg", payload,
+        )
+        sha1 = hashlib.sha1(payload).hexdigest()
+        # First lookup must find it.
+        found = harness_client.find_attachment_by_checksum(
+            "account.move", invoice_id, sha1,
+        )
+        assert found == aid
+
+        # Different res_id → no match (scope is per-record).
+        other_invoice_id = invoice_id + 1
+        not_found = harness_client.find_attachment_by_checksum(
+            "account.move", other_invoice_id, sha1,
+        )
+        assert not_found is None
+
+        # Different checksum on same record → no match.
+        not_found = harness_client.find_attachment_by_checksum(
+            "account.move", invoice_id, "deadbeef" * 5,
+        )
+        assert not_found is None
+
+    def test_verify_attachment_confirms_aid_is_on_expected_record(
+        self, harness_client: OdooClient
+    ) -> None:
+        """verify_attachment is the Phase-3 duplicate-handling primitive.
+        It must return True only when the aid is still attached to the
+        expected (res_model, res_id) AND the attachment name still
+        contains the expected slug. Mismatches return False; transport
+        errors are NOT swallowed (caller's catchall handles)."""
+        rows = harness_client.search_read(
+            "account.move", [["name", "like", "INV/2026"]], ["id", "name"], limit=1
+        )
+        invoice_id = int(rows[0]["id"])
+        invoice_name = rows[0]["name"]
+        slug = invoice_name.replace("/", "-")
+        payload = b"\xff\xd8\xff\xe0verify-fixture"
+        aid = harness_client.attach(
+            "account.move", invoice_id,
+            f"{slug}_verify-test.jpg", "image/jpeg", payload,
+        )
+
+        # Happy path — all three conditions match.
+        assert harness_client.verify_attachment(
+            attachment_id=aid,
+            expected_res_model="account.move",
+            expected_res_id=invoice_id,
+            expected_name_contains=slug,
+        )
+        # Wrong model → False.
+        assert not harness_client.verify_attachment(
+            aid, "res.partner", invoice_id, slug,
+        )
+        # Wrong res_id → False.
+        assert not harness_client.verify_attachment(
+            aid, "account.move", invoice_id + 1, slug,
+        )
+        # Slug not in name → False (defensive against operator-edited names).
+        assert not harness_client.verify_attachment(
+            aid, "account.move", invoice_id, "INV-9999-99999",
+        )
+        # Non-existent aid → False.
+        assert not harness_client.verify_attachment(
+            999_999_999, "account.move", invoice_id, slug,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle — closed/reopened client transparently recovers (per global TDD rule)
 # ---------------------------------------------------------------------------
