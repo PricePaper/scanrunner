@@ -351,6 +351,100 @@ class TestPipelineE2E:
             "Pipeline.for_worker did not cap intra-op threads"
         )
 
+    def test_duplicate_with_attachment_intact_routes_to_done_duplicates(
+        self, harness_inbox: Path, tmp_path: Path
+    ) -> None:
+        """Phase-3 happy path: a file we've already processed is
+        re-dropped, Odoo still has the attachment for the recorded
+        invoice, so we move the duplicate to done/duplicates/ instead
+        of leaving it in the inbox forever."""
+        config_path = tmp_path / "config.yaml"
+        _write_test_config(config_path, harness_inbox)
+        pipeline = Pipeline.for_worker(str(config_path), "harness", harness_inbox)
+
+        target = harness_inbox / "Customer_Invoice-dup-happy.jpg"
+        src = next(
+            (Path("/home/ejprice/PycharmProjects/scanrunner/corpus/invoices/good")
+             .glob("INV-2026-05000_*.jpg")),
+            None,
+        )
+        if src is None:
+            pytest.skip("no INV-2026-05000 corpus sample available")
+        target.write_bytes(src.read_bytes())
+
+        # First processing: actually upload + archive.
+        outcome1 = pipeline.process(target)
+        assert outcome1.success and outcome1.attachment_id is not None
+        # Re-drop the same bytes under a different name so file_close
+        # fires fresh (path dedup is a different concern).
+        target = harness_inbox / "Customer_Invoice-dup-happy-retry.jpg"
+        target.write_bytes(src.read_bytes())
+        try:
+            outcome2 = pipeline.process(target)
+            assert outcome2.success, (
+                f"duplicate detection should yield success, got: {outcome2.error}"
+            )
+            # The duplicate should be in done/duplicates/, not done/INV/...
+            duplicates_dir = harness_inbox / "done" / "duplicates"
+            archived_dup = duplicates_dir / target.name
+            assert archived_dup.exists(), (
+                f"duplicate must be in {duplicates_dir}, contents: "
+                f"{list(duplicates_dir.iterdir()) if duplicates_dir.exists() else 'MISSING'}"
+            )
+            assert not target.exists(), "duplicate source must not remain in inbox"
+        finally:
+            target.unlink(missing_ok=True)
+
+    def test_duplicate_with_attachment_lost_in_odoo_reprocesses(
+        self, harness_inbox: Path, tmp_path: Path
+    ) -> None:
+        """If the ledger says a file was processed but Odoo no longer
+        has the attachment (operator deleted it, restore from backup
+        lost it), the daemon must re-upload — never silently treat as
+        already-done."""
+        from docscanner import ProcessedLedger
+
+        config_path = tmp_path / "config.yaml"
+        _write_test_config(config_path, harness_inbox)
+        pipeline = Pipeline.for_worker(str(config_path), "harness", harness_inbox)
+
+        src = next(
+            (Path("/home/ejprice/PycharmProjects/scanrunner/corpus/invoices/good")
+             .glob("INV-2026-05000_*.jpg")),
+            None,
+        )
+        if src is None:
+            pytest.skip("no INV-2026-05000 corpus sample available")
+        target = harness_inbox / "Customer_Invoice-dup-lost.jpg"
+        target.write_bytes(src.read_bytes())
+        digest = ProcessedLedger.file_digest(target)
+
+        # Plant a stale ledger row pointing at a non-existent Odoo aid.
+        ledger = ProcessedLedger(harness_inbox / ".processed.sqlite3")
+        ledger.record_success(
+            digest, target.name,
+            odoo_id=973700,            # real account.move id, present
+            attachment_id=999_999_999, # fictitious aid — Odoo verify returns False
+            res_model="account.move",
+            ocr_name="INV/2026/05000",
+            archive_path=harness_inbox / "phantom.png",
+        )
+        ledger.close()
+
+        try:
+            outcome = pipeline.process(target)
+            assert outcome.success, (
+                f"verify-failed duplicate should reprocess, got: {outcome.error}"
+            )
+            # New attachment_id, NOT the phantom one.
+            assert outcome.attachment_id is not None
+            assert outcome.attachment_id != 999_999_999
+            # Real archive path, not the phantom one.
+            assert outcome.archive_path is not None
+            assert "INV" in str(outcome.archive_path)
+        finally:
+            target.unlink(missing_ok=True)
+
     def test_unlink_failure_emails_operator_and_preserves_outcome(
         self, harness_inbox: Path, tmp_path: Path
     ) -> None:

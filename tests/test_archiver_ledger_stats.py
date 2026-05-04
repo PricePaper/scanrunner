@@ -89,6 +89,43 @@ class TestArchiver:
         assert dest.read_bytes() == b"junk"
         assert not src.exists()
 
+    def test_archive_duplicate_moves_to_done_duplicates(self, tmp_path: Path) -> None:
+        """Phase-3 duplicate handler moves the source into
+        done/duplicates/<original-name> intact, leaving the canonical
+        copy in done/INV/... untouched. Audit trail beats silent
+        deletion for invoices."""
+        archiver = Archiver(tmp_path / "done")
+        src = tmp_path / "Customer_Invoice-dup-test.jpg"
+        src.write_bytes(b"\xff\xd8\xff\xe0duplicate-bytes")
+        dest = archiver.archive_duplicate(src)
+        assert dest == tmp_path / "done" / "duplicates" / src.name
+        assert dest.exists()
+        assert dest.read_bytes() == b"\xff\xd8\xff\xe0duplicate-bytes"
+        # Source removed from inbox.
+        assert not src.exists()
+
+    def test_archive_duplicate_collision_uses_numeric_suffix(
+        self, tmp_path: Path
+    ) -> None:
+        """Operator drops the same-named file repeatedly: each lands in
+        done/duplicates/ with a counter suffix so we never overwrite a
+        prior duplicate. Three drops → name, name.1, name.2."""
+        archiver = Archiver(tmp_path / "done")
+        for i in range(3):
+            src = tmp_path / "Customer_Invoice-collide.jpg"
+            src.write_bytes(f"copy-{i}".encode())
+            archiver.archive_duplicate(src)
+        dups_dir = tmp_path / "done" / "duplicates"
+        names = sorted(p.name for p in dups_dir.iterdir())
+        assert names == [
+            "Customer_Invoice-collide.1.jpg",
+            "Customer_Invoice-collide.2.jpg",
+            "Customer_Invoice-collide.jpg",
+        ]
+        assert (dups_dir / "Customer_Invoice-collide.jpg").read_bytes() == b"copy-0"
+        assert (dups_dir / "Customer_Invoice-collide.1.jpg").read_bytes() == b"copy-1"
+        assert (dups_dir / "Customer_Invoice-collide.2.jpg").read_bytes() == b"copy-2"
+
     def test_png_extension_used_when_mime_is_png(self, tmp_path: Path) -> None:
         archiver = Archiver(tmp_path)
         parsed = ParsedName("INV", 2026, 5000)

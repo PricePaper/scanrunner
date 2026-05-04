@@ -1872,6 +1872,44 @@ class Archiver:
         os.replace(tmp_path, dest_path)
         return dest_path
 
+    def archive_duplicate(self, src_path: Path) -> Path:
+        """Phase-3 duplicate handler.
+
+        Moves ``src_path`` into ``done/duplicates/<original-name>``,
+        intact (no v3 cleanup — the canonical clean copy already lives
+        in ``done/INV/...`` from the first processing). On name
+        collision, appends a numeric counter so we never overwrite a
+        prior duplicate.
+
+        Audit trail beats silent deletion for invoices: even a
+        duplicate is a real document the operator may want to see.
+        """
+        dest_dir: Path = self._root / "duplicates"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path: Path = self._unique_dest(dest_dir, src_path.name)
+        # shutil.move handles cross-fs (the inbox bind mount and done/
+        # may be on different filesystems).
+        shutil.move(str(src_path), str(dest_path))
+        return dest_path
+
+    @staticmethod
+    def _unique_dest(dest_dir: Path, name: str) -> Path:
+        """Return a non-existing path inside ``dest_dir`` based on
+        ``name``. First attempt uses the bare name; subsequent
+        collisions get a numeric counter inserted before the suffix
+        (``foo.jpg`` → ``foo.1.jpg`` → ``foo.2.jpg``)."""
+        candidate: Path = dest_dir / name
+        if not candidate.exists():
+            return candidate
+        stem: str = candidate.stem
+        suffix: str = candidate.suffix
+        n: int = 1
+        while True:
+            candidate = dest_dir / f"{stem}.{n}{suffix}"
+            if not candidate.exists():
+                return candidate
+            n += 1
+
     def archive_unreadable(
         self,
         src_path: Path,
@@ -2333,8 +2371,39 @@ class Pipeline:
         try:
             digest = ProcessedLedger.file_digest(source)
             if self._ledger.has(digest):
-                self._log.info("skip duplicate (already processed): %s", source.name)
-                return ProcessOutcome(source, True, None, None, None, None, None, None)
+                # Phase-3 verified-duplicate handling: confirm the
+                # Odoo attachment we recorded is still attached to the
+                # right invoice before retiring the duplicate. If
+                # Odoo lost it, blow away the stale ledger row and
+                # reprocess so we never silently treat a missing
+                # upload as already-done.
+                row: ProcessedRow | None = self._ledger.get_success_row(digest)
+                if row is not None and self._odoo.verify_attachment(
+                    attachment_id=row.attachment_id,
+                    expected_res_model=row.res_model,
+                    expected_res_id=row.odoo_id,
+                    expected_name_contains=row.ocr_name.replace("/", "-"),
+                ):
+                    dup_path: Path = self._archiver.archive_duplicate(source)
+                    self._log.info(
+                        "duplicate of %s (aid=%s) → %s",
+                        row.ocr_name, row.attachment_id, dup_path,
+                    )
+                    return ProcessOutcome(
+                        source, True, row.ocr_name, row.odoo_id,
+                        row.attachment_id, dup_path, None, None,
+                    )
+                # Verify failed (or row is None for a pre-Phase-2 ledger
+                # entry without enough info to check): clear the stale
+                # ledger row and fall through to reprocessing. Phase-2
+                # idempotency at upload time prevents a duplicate
+                # attachment in the rare case Odoo actually does still
+                # have it.
+                self._log.warning(
+                    "ledger says %s was processed but Odoo can't confirm — "
+                    "reprocessing", source.name,
+                )
+                self._ledger.delete(digest)
             return self._process_inner(source, digest, keep_original)
         except Exception as e:
             # Catchall = infra failure (network, cache permission, …).
